@@ -1,1 +1,1 @@
-# misp-taxii-connector
+# misp-taxii-connector-service
