@@ -321,6 +321,7 @@ def main():
 
         otx_client = OTXClient(
             api_key=config.OTX_API_KEY,
+            allowed_authors=config.OTX_AUTHOR_FILTER,  # NEW
             redis_host=config.REDIS_HOST,
             redis_port=config.REDIS_PORT,
             redis_db=config.REDIS_DB,

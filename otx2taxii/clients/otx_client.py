@@ -13,6 +13,43 @@ from clients.redis_utility import RedisClient
 logger = logging.getLogger(__name__)
 
 
+class FilteredOTXv2Cached(OTXv2Cached):
+    """
+    Subclass of OTXv2Cached that filters out non-whitelisted authors at
+    write time. The OTX API returns all subscribed authors' pulses; we
+    skip persistence for any author not in the whitelist.
+
+    This does NOT make the initial fetch faster — the SDK still iterates
+    every pulse in memory. It only prevents non-whitelisted pulses from
+    being written to the local on-disk cache.
+    """
+
+    def __init__(
+        self,
+        api_key,
+        allowed_authors=None,
+        cache_dir=None,
+        max_age=None,
+        *args,
+        **kwargs,
+    ):
+        # Normalize to lowercase set for case-insensitive matching
+        self._allowed_authors = (
+            {a.lower() for a in allowed_authors} if allowed_authors else None
+        )
+        super().__init__(api_key, cache_dir=cache_dir, max_age=max_age, *args, **kwargs)
+
+    def save_pulse(self, p):
+        """Override to skip writing pulses from non-whitelisted authors."""
+        if self._allowed_authors is not None:
+            author = (p.get("author_name") or "").lower()
+            if author not in self._allowed_authors:
+                # Silently skip — do not log per-pulse (would spam the log on
+                # large subscription lists)
+                return None
+        return super().save_pulse(p)
+
+
 class OTXAPIUnavailable(Exception):
     """Raised when the OTX API is unreachable or returning server errors.
     main.py should treat this as fatal (exit non-zero) so Docker restart
@@ -40,6 +77,7 @@ class OTXClient:
     def __init__(
         self,
         api_key: str,
+        allowed_authors: list[str] | None = None,
         redis_host: str = "localhost",
         redis_port: int = 6379,
         redis_db: int = 0,
@@ -51,10 +89,20 @@ class OTXClient:
         otx_cache_dir = os.getenv(
             "OTX_CACHE_DIR", os.path.expanduser("~/.otx_cache_data")
         )
-        self.otx = OTXv2Cached(api_key, cache_dir=otx_cache_dir)
-        logger.info(
-            f"OTX Client initialized with OTXv2Cached. Cache directory: {otx_cache_dir}"
+        self.otx = FilteredOTXv2Cached(
+            api_key, allowed_authors=allowed_authors, cache_dir=otx_cache_dir
         )
+        logger.info(
+            f"OTX Client initialized with FilteredOTXv2Cached. Cache directory: {otx_cache_dir}"
+        )
+        if allowed_authors:
+            logger.info(
+                f"OTX cache write filter active: only saving pulses from {len(allowed_authors)} whitelisted author(s)"
+            )
+        else:
+            logger.info(
+                "OTX cache write filter not active: all subscribed authors will be cached"
+            )
 
         self.redis_client_instance = RedisClient(
             redis_host, redis_port, redis_db, redis_password
