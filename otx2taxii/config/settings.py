@@ -52,23 +52,37 @@ class Config:
         self.MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
 
         # OTX Author Filter Configuration
-        # If set to a specific author name, only pulses from that author will be processed
-        # If set to None/empty, pulses from ALL subscribed authors will be processed
-        self.OTX_AUTHOR_FILTER = os.getenv("OTX_AUTHOR_FILTER", None)
-        if self.OTX_AUTHOR_FILTER and self.OTX_AUTHOR_FILTER.lower() in (
+        # If set to a comma-separated list of author names, only pulses from
+        # those authors will be processed. Matching is case-insensitive and
+        # whitespace is trimmed.
+        # If set to None/empty/'none'/'all'/'null', pulses from ALL subscribed
+        # authors will be processed.
+        #
+        # Example (whitelist of multiple authors):
+        #   OTX_AUTHOR_FILTER=AlienVault,MalwarePatrol,Conrat45,SeventySix
+        raw_filter = os.getenv("OTX_AUTHOR_FILTER", None)
+        if raw_filter is None or raw_filter.strip().lower() in (
             "none",
             "null",
             "",
             "all",
         ):
             self.OTX_AUTHOR_FILTER = None
+        else:
+            # Parse comma-separated list, trim whitespace, drop empty entries.
+            # Always store as a list (possibly empty -> treated as None below).
+            parsed = [a.strip() for a in raw_filter.split(",") if a.strip()]
+            self.OTX_AUTHOR_FILTER = parsed if parsed else None
 
         logger.info(
             f"Config loaded: TAXII_TEST_OBJECT_LIMIT={self.TAXII_TEST_OBJECT_LIMIT}, OTX_TEST_PULSE_LIMIT={self.OTX_TEST_PULSE_LIMIT}"
         )
-        logger.info(
-            f"OTX Author Filter: {'ALL subscribed authors' if self.OTX_AUTHOR_FILTER is None else self.OTX_AUTHOR_FILTER}"
-        )
+        if self.OTX_AUTHOR_FILTER is None:
+            logger.info("OTX Author Filter: ALL subscribed authors")
+        else:
+            logger.info(
+                f"OTX Author Filter: whitelist of {len(self.OTX_AUTHOR_FILTER)} author(s): {self.OTX_AUTHOR_FILTER}"
+            )
 
     def _get_env_variable(self, key: str) -> str:
         """

@@ -96,7 +96,9 @@ class OTXClient:
                 )
 
     def get_all_subscribed_pulses(
-        self, author_name: str | None = None, max_pulses: int | None = None
+        self,
+        author_name: str | list[str] | None = None,
+        max_pulses: int | None = None,
     ) -> list[dict]:
         """
         Retrieves all pulses that the authenticated user is subscribed to from OTX.
@@ -105,18 +107,31 @@ class OTXClient:
         If max_pulses is None, retrieves all available pulses without limitation.
 
         Args:
-            author_name: Filter pulses by specific author (e.g., "AlienVault").
-                        If None, retrieves pulses from ALL subscribed authors.
+            author_name: Filter pulses by author. Accepts:
+                        - None: retrieves pulses from ALL subscribed authors.
+                        - str: a single author name (e.g., "AlienVault").
+                        - list[str]: a whitelist of author names; matching is
+                          case-insensitive. The function will call OTX once per
+                          author and merge the results.
             max_pulses: Maximum number of pulses to retrieve (None for unlimited)
         """
         all_fetched_pulses = []
 
-        if author_name is None:
+        # Normalize author_name to one of:
+        #   None            -> all subscribed authors
+        #   list[str]       -> whitelist of authors (case-insensitive matching)
+        if isinstance(author_name, str):
+            author_name = [author_name]
+        author_whitelist = {a.lower() for a in author_name} if author_name else None
+
+        if author_whitelist is None:
             logger.info(
                 "No author specified - will retrieve pulses from ALL subscribed authors"
             )
         else:
-            logger.info(f"Will filter pulses by author: {author_name}")
+            logger.info(
+                f"Will filter pulses to {len(author_whitelist)} whitelisted author(s): {sorted(author_whitelist)}"
+            )
 
         if max_pulses is None:
             logger.info("No pulse limit set - will retrieve all available pulses")
@@ -134,8 +149,8 @@ class OTXClient:
 
             processed_pulses_count = 0
 
-            if author_name is None:
-                # Get pulses from ALL subscribed authors
+            if author_whitelist is None:
+                # No filter — get pulses from all subscribed authors
                 logger.info("Retrieving pulses from ALL subscribed authors")
                 for pulse in self.otx.getall(iter=True, limit=max_pulses):
                     if max_pulses is not None and processed_pulses_count >= max_pulses:
@@ -153,36 +168,45 @@ class OTXClient:
                             f"Processed {processed_pulses_count} pulses so far (from all authors)..."
                         )
             else:
-                # Filter by specific author
-                logger.info(f"Filtering pulses by author: {author_name}")
-                for pulse in self.otx.getall(
-                    iter=True, author_name=author_name, limit=max_pulses
-                ):
+                # Whitelist filter — call getall() once per author and merge results.
+                # The OTXv2 SDK's author_name parameter only supports a single author,
+                # so we make N calls (one per whitelisted author) and combine the results.
+                logger.info(
+                    f"Filtering pulses by whitelisted authors (will call OTX API {len(author_whitelist)} times)"
+                )
+                # Preserve user-provided order for predictable logging
+                for author in sorted(author_whitelist):
+                    logger.info(f"  -> Fetching pulses for author: '{author}'")
+                    for pulse in self.otx.getall(
+                        iter=True, author_name=author, limit=max_pulses
+                    ):
+                        if (
+                            max_pulses is not None
+                            and processed_pulses_count >= max_pulses
+                        ):
+                            logger.info(
+                                f"Reached test limit of {max_pulses} pulses. Stopping iteration."
+                            )
+                            break
+                        # Defensive: case-insensitive re-check (SDK matching may differ)
+                        pulse_author = (pulse.get("author_name") or "").lower()
+                        if pulse_author != author:
+                            logger.debug(
+                                f"Skipping pulse {pulse.get('id')} from author '{pulse_author}' (not {author})"
+                            )
+                            continue
+                        all_fetched_pulses.append(pulse)
+                        processed_pulses_count += 1
+                        # Log every 100 pulses for progress tracking
+                        if processed_pulses_count % 100 == 0:
+                            logger.info(
+                                f"Processed {processed_pulses_count} whitelisted-author pulses so far..."
+                            )
                     if max_pulses is not None and processed_pulses_count >= max_pulses:
-                        logger.info(
-                            f"Reached test limit of {max_pulses} pulses from cache. Stopping iteration."
-                        )
                         break
 
-                    # Additional verification to ensure we only get the specified author's pulses
-                    pulse_author = pulse.get("author_name", "")
-                    if pulse_author != author_name:
-                        logger.debug(
-                            f"Skipping pulse {pulse.get('id')} from author '{pulse_author}' (not {author_name})"
-                        )
-                        continue
-
-                    all_fetched_pulses.append(pulse)
-                    processed_pulses_count += 1
-
-                    # Log every 100 pulses for progress tracking
-                    if processed_pulses_count % 100 == 0:
-                        logger.info(
-                            f"Processed {processed_pulses_count} {author_name} pulses so far..."
-                        )
-
             if all_fetched_pulses:
-                if author_name is None:
+                if author_whitelist is None:
                     logger.info(
                         f"Successfully retrieved {len(all_fetched_pulses)} pulses from OTXv2Cached's local cache (from all subscribed authors)."
                     )
@@ -200,8 +224,20 @@ class OTXClient:
                         logger.info(f"  - {author}: {count} pulses")
                 else:
                     logger.info(
-                        f"Successfully retrieved {len(all_fetched_pulses)} pulses from OTXv2Cached's local cache (filtered by {author_name})."
+                        f"Successfully retrieved {len(all_fetched_pulses)} pulses from whitelisted authors: {sorted(author_whitelist)}"
                     )
+
+                    # Log author distribution (only for whitelisted authors actually seen)
+                    author_counts = {}
+                    for pulse in all_fetched_pulses:
+                        author = pulse.get("author_name", "Unknown")
+                        author_counts[author] = author_counts.get(author, 0) + 1
+
+                    logger.info("Pulse distribution by author (whitelisted):")
+                    for author, count in sorted(
+                        author_counts.items(), key=lambda x: x[1], reverse=True
+                    ):
+                        logger.info(f"  - {author}: {count} pulses")
 
                 latest_modified_time_in_batch = None
                 for pulse in all_fetched_pulses:
@@ -233,13 +269,13 @@ class OTXClient:
                         "No pulses with valid 'modified' timestamps were found to update the application's last fetch time."
                     )
             else:
-                if author_name is None:
+                if author_whitelist is None:
                     logger.info(
                         "No new or updated pulses found from any subscribed author in OTXv2Cached's local cache after update."
                     )
                 else:
                     logger.info(
-                        f"No new or updated pulses by '{author_name}' found in OTXv2Cached's local cache after update."
+                        f"No new or updated pulses from whitelisted authors: {sorted(author_whitelist)} found in OTXv2Cached's local cache after update."
                     )
 
             return all_fetched_pulses
