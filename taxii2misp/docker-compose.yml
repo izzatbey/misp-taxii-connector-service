@@ -1,0 +1,63 @@
+services:
+  redis-taxii2misp:
+    image: redis:7-alpine
+    container_name: redis-taxii2misp
+    restart: unless-stopped
+    ports:
+      - "6380:6379"  # Using port 6380 externally to avoid conflict
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - taxii2misp_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  taxii2misp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ./logs:/app/logs
+      - ./temp:/app/temp
+      - ./data:/app/data
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+    restart: unless-stopped
+    container_name: taxii2misp-connector
+    depends_on:
+      redis-taxii2misp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - taxii2misp_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  taxii2misp_network:
+    driver: bridge
+
+volumes:
+  logs:
+    driver: local
+  temp:
+    driver: local
+  data:
+    driver: local
+  redis_data:
+    driver: local

@@ -1,0 +1,17 @@
+antlr4-python3-runtime==4.9.3
+certifi==2025.6.15
+charset-normalizer==3.4.2
+idna==3.10
+OTXv2==1.5.12
+python-dateutil==2.9.0.post0
+python-dotenv==1.1.0
+pytz==2025.2
+requests==2.32.4
+simplejson==3.20.1
+six==1.17.0
+stix2==3.0.1
+stix2-patterns==2.0.0
+taxii2-client==2.3.0
+urllib3==2.4.0
+redis
+python-dotenv

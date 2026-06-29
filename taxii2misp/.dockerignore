@@ -1,0 +1,75 @@
+# taxii2misp .dockerignore
+# Tells Docker which files to EXCLUDE from the build context when running
+# `docker build`. This is NOT the same as .gitignore — it's about image size
+# and reproducibility, not source control.
+#
+# Build context = the taxii2misp/ directory itself
+# Build target  = docker/Dockerfile
+
+# --- VCS metadata --------------------------------------------------------
+.git
+.gitignore
+
+# --- Python build artifacts & virtual envs -------------------------------
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+venv/
+.venv/
+env/
+
+# --- Secrets (defensive — even though Dockerfile only COPYs .env.example) -
+.env
+.env.*
+!.env.example
+
+# --- Documentation -------------------------------------------------------
+# Only README.md is useful inside the image; everything else is dev docs.
+*.md
+!README.md
+
+# --- Debug & diagnostic scripts ------------------------------------------
+# Not needed at runtime in the container.
+test_*.py
+diagnose_connectivity.py
+fix_verification.py
+Makefile
+
+# --- Docker files themselves --------------------------------------------
+# The Dockerfile, compose, and .dockerignore are build-time only.
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# The docker/ subdirectory holds the actual Dockerfile and an unused
+# entrypoint.sh; the image build does not COPY anything from it.
+docker/
+
+# --- IDE / editor files --------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS-generated files --------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Runtime volume mounts ----------------------------------------------
+# These are bind-mounted by docker-compose.yml; copying them into the image
+# just wastes layers and can shadow the volume contents.
+logs/
+temp/
+data/
+output/

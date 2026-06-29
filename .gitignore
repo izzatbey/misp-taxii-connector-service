@@ -1,0 +1,64 @@
+# Root .gitignore for misp-taxii-connector
+# Master ignore list — applies to the entire repository, including both services.
+# Service-specific files belong in otx2taxii/.gitignore and taxii2misp/.gitignore.
+
+# --- Secrets & environment files -------------------------------------------
+# Ignore all .env files (real secrets). Explicitly allow .env.example templates
+# so new contributors can copy them as a starting point.
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# --- Python virtual environments ------------------------------------------
+# Covers the root venv/ and any venv/.venv/env/ at any depth.
+venv/
+.venv/
+env/
+ENV/
+
+# --- Python build & cache artifacts --------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# --- Tooling caches (linters, type-checkers, test runners) --------------
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.cache/
+.pytest_cache/
+
+# --- IDE / editor files ---------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vs/
+*.sublime-project
+*.sublime-workspace
+
+# --- OS-generated files ---------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+
+# --- Logs ------------------------------------------------------------------
+*.log
+logs/
+
+# --- Misc ------------------------------------------------------------------
+*.bak
+*.tmp
+*.orig
+*.rej

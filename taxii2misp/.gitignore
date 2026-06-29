@@ -1,0 +1,37 @@
+# taxii2misp service-specific ignores
+# General Python/IDE/OS rules live in the root .gitignore — only list things
+# that are specific to this service.
+
+# --- Secrets --------------------------------------------------------------
+# .env.example is the safe template and MUST be tracked.
+.env
+.env.*
+!.env.example
+
+# --- Runtime directories -------------------------------------------------
+# Mounted as Docker volumes by docker-compose.yml; should not be checked in.
+logs/
+output/
+data/
+temp/
+
+# --- One-off debug / diagnostic scripts ----------------------------------
+# These were used during development to verify connectivity and a bug fix.
+# They are not part of the production runtime and have no test scaffolding.
+diagnose_connectivity.py
+fix_verification.py
+
+# The following test stubs are EMPTY (0 bytes) — leftovers from scratch work,
+# not real tests. Real tests should live under a tests/ directory.
+test_*.py
+
+# Empty placeholder from the initial scaffold.
+Makefile
+
+# --- Local caches & databases -------------------------------------------
+# SQLite or similar state files that may appear if someone runs the service
+# outside Docker without removing the volume mounts.
+*.db
+*.sqlite
+*.sqlite3
+cache/

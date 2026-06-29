@@ -1,0 +1,55 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env
+pip-log.txt
+pip-delete-this-directory.txt
+.tox
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.venv
+venv/
+venv/*
+
+# Documentation
+*.md
+!README.md
+SCHEDULER_README.md
+
+# Docker
+Dockerfile
+docker-compose.yaml
+.dockerignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Service files
+otx2taxii.service
+
+# Logs
+logs/
+*.log
+
+# Output files that might be too large
+output/*.json

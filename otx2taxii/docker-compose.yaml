@@ -1,0 +1,54 @@
+services:
+  redis:
+    image: redis:latest
+    container_name: redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "PING"] # Basic health check for Redis
+      interval: 1m
+      timeout: 1m
+      retries: 5
+    networks:
+      - otx2taxii_network
+
+  otx2taxii:
+    build: .
+    container_name: otx2taxii-scheduler
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=
+      - CACHE_TTL_SECONDS=3600
+      - CACHE_REFRESH_THRESHOLD=300
+      - ENABLE_CACHE_PREVALIDATION=true
+      - MAX_BUNDLES_TO_PUSH=none
+      - SCHEDULER_INTERVAL_SECONDS=300
+    env_file:
+      - .env
+    volumes:
+      - ./output:/app/output
+      - ./logs:/app/logs
+    networks:
+      - otx2taxii_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import redis; r = redis.Redis(host='redis', port=6379, db=0); r.ping()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  otx2taxii_network:
+    driver: bridge
+
+volumes:
+  redis_data:

@@ -1,0 +1,28 @@
+# otx2taxii service-specific ignores
+# General Python/IDE/OS rules live in the root .gitignore — only list things
+# that are specific to this service.
+
+# --- Secrets --------------------------------------------------------------
+# .env.example is the safe template and MUST be tracked.
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# --- Local virtual environment -------------------------------------------
+# Per-service venv lives inside this directory.
+venv/
+.venv/
+
+# --- Runtime output & logs -----------------------------------------------
+# Large JSON bundles can bloat the repo; they regenerate on every run.
+output/
+output/*.json
+
+logs/
+*.log
+
+# --- OTXv2 SDK cache ------------------------------------------------------
+# The OTXv2 Python SDK writes a local cache here. It is intentionally NOT
+# mounted as a volume so it lives on the host filesystem and should be ignored.
+.otx_cache_data/
