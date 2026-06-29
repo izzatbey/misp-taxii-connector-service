@@ -18,7 +18,7 @@ services:
   otx2taxii:
     build: .
     container_name: otx2taxii-scheduler
-    restart: always
+    restart: on-failure
     depends_on:
       redis:
         condition: service_healthy
@@ -27,11 +27,6 @@ services:
       - REDIS_PORT=6379
       - REDIS_DB=0
       - REDIS_PASSWORD=
-      - CACHE_TTL_SECONDS=3600
-      - CACHE_REFRESH_THRESHOLD=300
-      - ENABLE_CACHE_PREVALIDATION=true
-      - MAX_BUNDLES_TO_PUSH=none
-      - SCHEDULER_INTERVAL_SECONDS=300
     env_file:
       - .env
     volumes:

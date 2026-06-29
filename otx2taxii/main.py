@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 from config.settings import Config
-from clients.otx_client import OTXClient
+from clients.otx_client import OTXClient, OTXAPIUnavailable
 from clients.taxii_client import TAXIIClient
 from services.pulse_processor import PulseProcessor
 
@@ -152,9 +152,10 @@ def process_otx_to_taxii(
     else:
         logging.info(f"Running with test pulse limit: {config.OTX_TEST_PULSE_LIMIT}")
 
-    # Pass the OTX_TEST_PULSE_LIMIT from config to the OTX client
+    # Pass the OTX_TEST_PULSE_LIMIT and OTX_AUTHOR_FILTER from config to the OTX client
     pulses_from_otx_generator = otx_client.get_all_subscribed_pulses(
-        max_pulses=config.OTX_TEST_PULSE_LIMIT
+        max_pulses=config.OTX_TEST_PULSE_LIMIT,
+        author_name=config.OTX_AUTHOR_FILTER,
     )
     pulses_from_otx = list(pulses_from_otx_generator)
 
@@ -341,6 +342,19 @@ def main():
             )
             logging.info("One-shot cycle complete. Exiting with status 0.")
             sys.exit(0)
+        except OTXAPIUnavailable as e:
+            # Upstream OTX API is down or rate-limiting us. Don't hammer it.
+            # Sleep for 5 minutes before exiting so Docker's restart policy
+            # gives the upstream time to recover instead of looping every 30s.
+            logging.error(
+                f"OTX API is unavailable: {e}. Sleeping 300s before exit "
+                "to back off and let the upstream recover."
+            )
+            time.sleep(300)
+            logging.error(
+                "One-shot cycle failed (OTX unavailable). Exiting with status 1."
+            )
+            sys.exit(1)
         except Exception as e:
             logging.error(f"Error in main processing loop: {e}", exc_info=True)
             logging.error("One-shot cycle failed. Exiting with status 1.")
