@@ -254,6 +254,160 @@ class OTXClient:
                     exc_info=True,
                 )
 
+    def iter_subscribed_pulses(
+        self,
+        author_name: str | list[str] | None = None,
+        max_pulses: int | None = None,
+    ):
+        """
+        Streaming variant of get_all_subscribed_pulses.
+
+        Same logic as get_all_subscribed_pulses, but yields each pulse as
+        it's loaded from the on-disk OTX cache instead of materialising
+        the entire list in RAM. The `last_fetched_timestamp` write at the
+        end still happens; we just track it as we go.
+
+        Use this from main.py when you have hundreds-to-thousands of
+        pulses per cycle — materialising the full list before processing
+        wastes peak RAM on the call site.
+        """
+        all_fetched_pulses = []
+
+        if isinstance(author_name, str):
+            author_name = [author_name]
+        author_whitelist = {a.lower() for a in author_name} if author_name else None
+
+        if author_whitelist is None:
+            logger.info(
+                "No author specified - will retrieve pulses from ALL subscribed authors"
+            )
+        else:
+            logger.info(
+                f"Will filter pulses to {len(author_whitelist)} whitelisted author(s): {sorted(author_whitelist)}"
+            )
+
+        if max_pulses is None:
+            logger.info("No pulse limit set - will retrieve all available pulses")
+        else:
+            logger.info(f"Will limit to {max_pulses} pulses total")
+
+        logger.info(
+            "Starting OTXv2Cached update to fetch new/modified pulses into local cache..."
+        )
+        try:
+            self.otx.update()
+            logger.info(
+                "OTXv2Cached update completed. Data should now be in local cache."
+            )
+
+            processed_pulses_count = 0
+
+            def _yield_and_track(pulse):
+                """Yield a pulse while tracking the latest-modified timestamp."""
+                nonlocal processed_pulses_count, latest_modified_time_in_batch
+                processed_pulses_count += 1
+                if processed_pulses_count % 100 == 0:
+                    logger.info(f"Processed {processed_pulses_count} pulses so far...")
+                modified_str = pulse.get("modified")
+                if modified_str:
+                    try:
+                        current_dt = datetime.datetime.fromisoformat(
+                            modified_str
+                        ).replace(tzinfo=pytz.UTC)
+                        # latest_modified_time_in_batch captured by closure below
+                    except ValueError:
+                        pass
+                return pulse
+
+            latest_modified_time_in_batch = None
+
+            def _track_modified(pulse):
+                """Update latest-modified-timestamp tracking (closure)."""
+                nonlocal latest_modified_time_in_batch
+                modified_str = pulse.get("modified")
+                if modified_str:
+                    try:
+                        current_dt = datetime.datetime.fromisoformat(
+                            modified_str
+                        ).replace(tzinfo=pytz.UTC)
+                        if (
+                            latest_modified_time_in_batch is None
+                            or current_dt > latest_modified_time_in_batch
+                        ):
+                            latest_modified_time_in_batch = current_dt
+                    except ValueError:
+                        logger.warning(
+                            f"Could not parse 'modified' timestamp '{modified_str}' for pulse {pulse.get('id')}."
+                        )
+
+            if author_whitelist is None:
+                logger.info("Retrieving pulses from ALL subscribed authors")
+                for pulse in self.otx.getall(iter=True, limit=max_pulses):
+                    if max_pulses is not None and processed_pulses_count >= max_pulses:
+                        break
+                    _track_modified(pulse)
+                    yield pulse
+            else:
+                logger.info(
+                    f"Filtering pulses by whitelisted authors (will call OTX API {len(author_whitelist)} times)"
+                )
+                for author in sorted(author_whitelist):
+                    logger.info(f"  -> Fetching pulses for author: '{author}'")
+                    for pulse in self.otx.getall(
+                        iter=True, author_name=author, limit=max_pulses
+                    ):
+                        if (
+                            max_pulses is not None
+                            and processed_pulses_count >= max_pulses
+                        ):
+                            break
+                        pulse_author = (pulse.get("author_name") or "").lower()
+                        if pulse_author != author:
+                            continue
+                        _track_modified(pulse)
+                        yield pulse
+                    if max_pulses is not None and processed_pulses_count >= max_pulses:
+                        break
+
+            # Persist the latest modified timestamp after we finish yielding
+            if latest_modified_time_in_batch:
+                self._set_last_fetched_timestamp(
+                    latest_modified_time_in_batch + datetime.timedelta(seconds=1)
+                )
+            else:
+                logger.info(
+                    "No pulses with valid 'modified' timestamps were found to update the application's last fetch time."
+                )
+
+        except requests.exceptions.Timeout as e:
+            logger.error(
+                f"OTX API update timed out: {e}.",
+                exc_info=True,
+            )
+            raise OTXAPIUnavailable(f"OTX API timeout: {e}") from e
+        except requests.exceptions.ConnectionError as e:
+            logger.error(
+                f"Failed to connect to OTX API during update: {e}.",
+                exc_info=True,
+            )
+            raise OTXAPIUnavailable(f"OTX API connection error: {e}") from e
+        except requests.exceptions.RequestException as e:
+            logger.error(
+                f"An HTTP error occurred during OTXv2Cached update: {e}", exc_info=True
+            )
+            raise OTXAPIUnavailable(f"OTX API HTTP error: {e}") from e
+        except OTXv2RetryError as e:
+            logger.error(
+                f"OTX SDK exhausted retries (likely upstream 5xx): {e}", exc_info=True
+            )
+            raise OTXAPIUnavailable(f"OTX API exhausted retries: {e}") from e
+        except Exception as e:
+            logger.error(
+                f"An unexpected error occurred during OTXv2Cached update: {e}",
+                exc_info=True,
+            )
+            raise OTXAPIUnavailable(f"Unexpected OTX error: {e}") from e
+
     def get_all_subscribed_pulses(
         self,
         author_name: str | list[str] | None = None,

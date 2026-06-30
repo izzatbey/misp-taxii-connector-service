@@ -95,6 +95,15 @@ class Config:
         # very deep pages. Set to e.g. 30 to cap to ~30 pages.
         self.OTX_MAX_LIST_PAGES = int(os.getenv("OTX_MAX_LIST_PAGES", "0"))
 
+        # Optional cap on indicators processed per single pulse.
+        # w0rmsign-style "server scanning" pulses can contain 500+
+        # indicators which dominates RAM and CPU during STIX bundle
+        # construction. Default 200 (was unlimited). Set to 0 to disable.
+        # Pulses with more indicators than this get a warning + truncated.
+        self.MAX_INDICATORS_PER_PULSE = int(
+            os.getenv("MAX_INDICATORS_PER_PULSE", "200")
+        )
+
         # OTX Author Filter Configuration
         # If set to a comma-separated list of author names, only pulses from
         # those authors will be processed. Matching is case-insensitive and

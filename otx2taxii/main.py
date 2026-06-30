@@ -48,6 +48,20 @@ def _interruptible_sleep(total_seconds: int) -> None:
         remaining -= chunk
 
 
+def _stix_bundle_to_dict(bundle) -> dict:
+    """
+    Convert a stix2.Bundle to a plain dict for TAXII push.
+
+    We use the proven JSON-round-trip path here. stix2's `obj._inner`
+    contains STIXdatetime / STIXObjectProperty values that
+    simplejson.dumps cannot encode directly — the taxii2-client library
+    has its own encoders but they expect the round-trip output. So
+    the round-trip is the safe and reliable approach; the streaming
+    iterator (iter_subscribed_pulses) is what gives the actual RAM win.
+    """
+    return json.loads(bundle.serialize())
+
+
 def _process_single_pulse(
     pulse_detail: dict,
     config,
@@ -90,60 +104,104 @@ def _process_single_pulse(
             )
             return push_success, processed_success, str(pulse_id), pulse_name
 
-        stix_bundle = pulse_processor.process_pulse_data(
+        stix_bundles = pulse_processor.process_pulse_data(
             pulse_detail, pulse_indicators, existing_stix_ids_snapshot
         )
 
-        if stix_bundle:
+        if stix_bundles:
             processed_success = True
+            total_chunks = len(stix_bundles)
 
-            bundle_as_dict = json.loads(stix_bundle.serialize())
-
-            # Pre-validate bundle to remove duplicates (if enabled)
-            if config.ENABLE_CACHE_PREVALIDATION:
-                original_count = len(bundle_as_dict.get("objects", []))
-                bundle_as_dict = taxii_client.pre_validate_bundle_objects(
-                    bundle_as_dict
+            if total_chunks > 1:
+                logging.info(
+                    f"[Pulse {pulse_id}] Pulse '{pulse_name}' produced "
+                    f"{total_chunks} chunk bundles — pushing each one separately."
                 )
-                validated_count = len(bundle_as_dict.get("objects", []))
 
-                if validated_count == 0:
-                    logging.info(
-                        f"[Pulse {pulse_id}] All objects in bundle for pulse '{pulse_name}' are duplicates. Skipping push."
+            # Track success across all chunks so we can decide whether to
+            # consider this pulse "fully pushed" or not.
+            chunks_pushed_ok = 0
+
+            for chunk_idx, stix_bundle in enumerate(stix_bundles, start=1):
+                chunk_label = (
+                    f"chunk {chunk_idx}/{total_chunks}"
+                    if total_chunks > 1
+                    else "bundle"
+                )
+
+                # Convert STIX Bundle → dict for TAXII push. The actual RAM
+                # win comes from streaming pulses (see iter_subscribed_pulses);
+                # the round-trip here is the only safe path because stix2's
+                # _inner dict contains non-JSON-serialisable STIXdatetime.
+                bundle_as_dict = _stix_bundle_to_dict(stix_bundle)
+
+                # Pre-validate bundle to remove duplicates (if enabled)
+                if config.ENABLE_CACHE_PREVALIDATION:
+                    original_count = len(bundle_as_dict.get("objects", []))
+                    bundle_as_dict = taxii_client.pre_validate_bundle_objects(
+                        bundle_as_dict
                     )
-                    return push_success, processed_success, str(pulse_id), pulse_name
-                elif validated_count < original_count:
+                    validated_count = len(bundle_as_dict.get("objects", []))
+
+                    if validated_count == 0:
+                        logging.info(
+                            f"[Pulse {pulse_id}] {chunk_label}: all objects are duplicates. Skipping push."
+                        )
+                        continue
+                    elif validated_count < original_count:
+                        logging.info(
+                            f"[Pulse {pulse_id}] {chunk_label} pre-validation: "
+                            f"{original_count} → {validated_count} objects "
+                            f"(removed {original_count - validated_count} duplicates)"
+                        )
+
+                if config.ENABLE_CACHE_PREVALIDATION:
+                    for obj in bundle_as_dict.get("objects", []):
+                        if "id" in obj:
+                            otx_client.cache_stix_uuid(obj["id"], pulse_id)
+
+                logging.info(
+                    f"[Pulse {pulse_id}] Attempting to push {chunk_label} "
+                    f"for pulse '{pulse_name}' to TAXII..."
+                )
+                if taxii_client.add_stix_bundle(bundle_as_dict):
+                    chunks_pushed_ok += 1
                     logging.info(
-                        f"[Pulse {pulse_id}] Bundle pre-validation for pulse '{pulse_name}': {original_count} → {validated_count} objects (removed {original_count - validated_count} duplicates)"
+                        f"[Pulse {pulse_id}] Successfully pushed {chunk_label} "
+                        f"({chunks_pushed_ok}/{total_chunks} so far)."
+                    )
+                else:
+                    logging.error(
+                        f"[Pulse {pulse_id}] Failed to push {chunk_label} "
+                        f"for pulse '{pulse_name}' to TAXII."
                     )
 
-            if config.ENABLE_CACHE_PREVALIDATION:
-                for obj in bundle_as_dict.get("objects", []):
-                    if "id" in obj:
-                        otx_client.cache_stix_uuid(obj["id"], pulse_id)
-
-            logging.info(
-                f"[Pulse {pulse_id}] Attempting to push STIX Bundle for pulse '{pulse_name}' to TAXII..."
-            )
-            if taxii_client.add_stix_bundle(bundle_as_dict):
+            # The pulse is considered "fully pushed" only if every chunk
+            # succeeded. If any chunk failed, we re-attempt next cycle
+            # (the indicator cache check will skip already-pushed chunks
+            # because their grouping IDs will already be in TAXII).
+            if chunks_pushed_ok == total_chunks and total_chunks > 0:
                 push_success = True
 
-                # Store pulse in cache for future change detection
-                pulse_detail["indicators"] = (
-                    pulse_indicators  # Make sure indicators are included
-                )
+                # Store pulse in cache for future change detection (only
+                # when ALL chunks pushed — otherwise we'll retry next cycle
+                # and the change-detection will still trigger).
+                pulse_detail["indicators"] = pulse_indicators
                 otx_client._cache_pulse(pulse_detail)
 
                 logging.info(
-                    f"[Pulse {pulse_id}] Successfully pushed bundle for Pulse '{pulse_name}'."
+                    f"[Pulse {pulse_id}] All {total_chunks} chunk(s) pushed "
+                    f"successfully for Pulse '{pulse_name}'."
                 )
             else:
-                logging.error(
-                    f"[Pulse {pulse_id}] Failed to push STIX Bundle for pulse '{pulse_name}' to TAXII."
+                logging.warning(
+                    f"[Pulse {pulse_id}] Only {chunks_pushed_ok}/{total_chunks} "
+                    f"chunks pushed for Pulse '{pulse_name}'. Will retry "
+                    "remaining chunks on next cycle."
                 )
         else:
             logging.info(
-                f"[Pulse {pulse_id}] No new STIX Bundle generated for pulse '{pulse_name}' (likely a duplicate Grouping or no indicators). Skipping push."
+                f"[Pulse {pulse_id}] No new STIX Bundle generated for pulse '{pulse_name}' (likely all chunks already exist in TAXII or no indicators). Skipping push."
             )
 
     except Exception as e:
@@ -166,121 +224,135 @@ def process_otx_to_taxii(
     else:
         logging.info(f"Running with test pulse limit: {config.OTX_TEST_PULSE_LIMIT}")
 
-    # Pass the OTX_TEST_PULSE_LIMIT and OTX_AUTHOR_FILTER from config to the OTX client
-    pulses_from_otx_generator = otx_client.get_all_subscribed_pulses(
+    # Use the streaming iterator so we don't materialise all 1500+ pulses
+    # in RAM before submitting work. The previous `list(generator)` kept
+    # every pulse dict alive until the cycle finished — for w0rmsign
+    # subscriptions with thousands of pulses that was the dominant RAM
+    # spike on small VMs.
+    pulses_from_otx_generator = otx_client.iter_subscribed_pulses(
         max_pulses=config.OTX_TEST_PULSE_LIMIT,
         author_name=config.OTX_AUTHOR_FILTER,
     )
-    pulses_from_otx = list(pulses_from_otx_generator)
 
-    if not pulses_from_otx:
+    # Peek the first item for log/early-exit; otherwise pass the generator
+    # straight into the executor submit loop.
+    try:
+        first_pulse = next(pulses_from_otx_generator)
+    except StopIteration:
         logging.info(
             "No new or updated pulses retrieved from OTX for the current time window. Nothing to process or push."
         )
-    else:
-        logging.info(
-            f"Found {len(pulses_from_otx)} new/updated pulses from OTX to potentially process and push."
-        )
+        return
 
-        processed_pulses_count = 0
-        pushed_bundles_count = 0
+    # Re-chain the generator so the executor consumes ALL pulses.
+    def _all_pulses():
+        yield first_pulse
+        yield from pulses_from_otx_generator
 
-        output_dir = "./output/"
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+    pulses_from_otx = _all_pulses()
+    logging.info(
+        "Streaming pulses from OTX (first pulse seen; count will be reported at end of cycle)."
+    )
 
-        # ------------------------------------------------------------------
-        # Parallel per-pulse processing.
-        #
-        # Each worker receives its OWN copy of `existing_stix_ids` via
-        # `.copy()` on submission. This prevents the threads from corrupting
-        # the shared de-dup set (set mutations from concurrent threads are
-        # not safe and would intermittently lose or duplicate IDs).
-        #
-        # MAX_BUNDLES_TO_PUSH semantics: we still cap total successful pushes,
-        # but the cap is now "stop accepting NEW work after N successes".
-        # Choice: `threading.Lock` + an int counter — cleaner than a shared
-        # list of completed futures because the early-stop decision is a
-        # single atomic check (`counter >= limit`) inside the submitter's
-        # `as_completed` loop, with no need to mutate a list under a lock
-        # for every completion. Workers themselves are uninstrumented.
-        # ------------------------------------------------------------------
-        max_push_limit = config.MAX_BUNDLES_TO_PUSH
-        push_counter_lock = threading.Lock()
-        pushed_so_far = 0
+    processed_pulses_count = 0
+    pushed_bundles_count = 0
 
-        with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
-            # Map future -> (pulse_id, pulse_name) so we can log cancellation context.
-            futures = {}
-            for pulse_detail in pulses_from_otx:
-                # Honour the cap by refusing to submit any new work once we've
-                # already reached the limit. Already-running workers finish.
-                if max_push_limit is not None:
-                    with push_counter_lock:
-                        if pushed_so_far >= max_push_limit:
-                            logging.info(
-                                f"Reached the maximum push limit of {max_push_limit} bundles. "
-                                "Not submitting further work; already-running workers will complete."
-                            )
-                            break
+    output_dir = "./output/"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-                pulse_id = pulse_detail.get("id")
-                pulse_name = pulse_detail.get("name", "N/A")
+    # ------------------------------------------------------------------
+    # Parallel per-pulse processing.
+    #
+    # Each worker receives its OWN copy of `existing_stix_ids` via
+    # `.copy()` on submission. This prevents the threads from corrupting
+    # the shared de-dup set (set mutations from concurrent threads are
+    # not safe and would intermittently lose or duplicate IDs).
+    #
+    # MAX_BUNDLES_TO_PUSH semantics: we still cap total successful pushes,
+    # but the cap is now "stop accepting NEW work after N successes".
+    # Choice: `threading.Lock` + an int counter — cleaner than a shared
+    # list of completed futures because the early-stop decision is a
+    # single atomic check (`counter >= limit`) inside the submitter's
+    # `as_completed` loop, with no need to mutate a list under a lock
+    # for every completion. Workers themselves are uninstrumented.
+    # ------------------------------------------------------------------
+    max_push_limit = config.MAX_BUNDLES_TO_PUSH
+    push_counter_lock = threading.Lock()
+    pushed_so_far = 0
 
-                # Per-worker private copy of the de-dup set.
-                snapshot = existing_stix_ids.copy()
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
+        # Map future -> (pulse_id, pulse_name) so we can log cancellation context.
+        futures = {}
+        for pulse_detail in pulses_from_otx:
+            # Honour the cap by refusing to submit any new work once we've
+            # already reached the limit. Already-running workers finish.
+            if max_push_limit is not None:
+                with push_counter_lock:
+                    if pushed_so_far >= max_push_limit:
+                        logging.info(
+                            f"Reached the maximum push limit of {max_push_limit} bundles. "
+                            "Not submitting further work; already-running workers will complete."
+                        )
+                        break
 
-                future = executor.submit(
-                    _process_single_pulse,
-                    pulse_detail,
-                    config,
-                    otx_client,
-                    taxii_client,
-                    pulse_processor,
-                    snapshot,
-                )
-                futures[future] = (str(pulse_id), pulse_name)
+            pulse_id = pulse_detail.get("id")
+            pulse_name = pulse_detail.get("name", "N/A")
 
-            # Drain completed futures, update the shared counter, aggregate results.
-            results = []
-            for future in as_completed(futures):
-                pid, pname = futures[future]
-                try:
-                    push_success, processed_success, _pid, _pname = future.result()
-                except Exception as e:
-                    # _process_single_pulse swallows its own exceptions and returns
-                    # (False, False, ...). This is a true belt-and-suspenders guard
-                    # for any unexpected error raised outside the inner try/except.
-                    logging.error(
-                        f"Unhandled exception from worker for pulse '{pname}' (ID: {pid}): {e}",
-                        exc_info=True,
-                    )
-                    push_success, processed_success = False, False
+            # Per-worker private copy of the de-dup set.
+            snapshot = existing_stix_ids.copy()
 
-                if push_success:
-                    with push_counter_lock:
-                        pushed_so_far += 1
-                results.append((push_success, processed_success))
-
-        # Aggregate after the pool is fully shut down.
-        processed_pulses_count = sum(1 for _, p in results if p)
-        pushed_bundles_count = sum(1 for s, _ in results if s)
-
-        logging.info(f"\n--- OTX to TAXII Synchronization Summary ---")
-        logging.info(
-            f"Total OTX Pulses retrieved and considered: {len(pulses_from_otx)}"
-        )
-        logging.info(
-            f"Total OTX Pulses processed into new STIX Bundles: {processed_pulses_count}"
-        )
-        logging.info(
-            f"Total STIX Bundles successfully pushed to TAXII: {pushed_bundles_count}"
-        )
-
-        if pushed_bundles_count == 0:
-            logging.info(
-                "Note: zero bundles pushed (likely all duplicates, all pre-validated, or no new pulses from OTX)."
+            future = executor.submit(
+                _process_single_pulse,
+                pulse_detail,
+                config,
+                otx_client,
+                taxii_client,
+                pulse_processor,
+                snapshot,
             )
+            futures[future] = (str(pulse_id), pulse_name)
+
+        # Drain completed futures, update the shared counter, aggregate results.
+        results = []
+        for future in as_completed(futures):
+            pid, pname = futures[future]
+            try:
+                push_success, processed_success, _pid, _pname = future.result()
+            except Exception as e:
+                # _process_single_pulse swallows its own exceptions and returns
+                # (False, False, ...). This is a true belt-and-suspenders guard
+                # for any unexpected error raised outside the inner try/except.
+                logging.error(
+                    f"Unhandled exception from worker for pulse '{pname}' (ID: {pid}): {e}",
+                    exc_info=True,
+                )
+                push_success, processed_success = False, False
+
+            if push_success:
+                with push_counter_lock:
+                    pushed_so_far += 1
+            results.append((push_success, processed_success))
+
+    # Aggregate after the pool is fully shut down.
+    processed_pulses_count = sum(1 for _, p in results if p)
+    pushed_bundles_count = sum(1 for s, _ in results if s)
+
+    logging.info(f"\n--- OTX to TAXII Synchronization Summary ---")
+    # Note: pulses_from_otx is a generator now so we can't len() it.
+    # The results list gives us the count of processed pulses.
+    logging.info(f"Total OTX Pulses submitted to executor: {len(results)}")
+    logging.info(
+        f"Total OTX Pulses processed into new STIX Bundles: {processed_pulses_count}"
+    )
+    logging.info(
+        f"Total STIX Bundles successfully pushed to TAXII: {pushed_bundles_count}"
+    )
+
+    if pushed_bundles_count == 0:
+        logging.info(
+            "Note: zero bundles pushed (likely all duplicates, all pre-validated, or no new pulses from OTX)."
+        )
 
 
 def main():
@@ -312,12 +384,15 @@ def main():
             f"OTX_REQUEST_DELAY_SECONDS={config.OTX_REQUEST_DELAY_SECONDS}, "
             f"OTX_LIST_PAGE_DELAY_SECONDS={config.OTX_LIST_PAGE_DELAY_SECONDS}, "
             f"OTX_CACHE_CLEAR_ON_START={config.OTX_CACHE_CLEAR_ON_START}, "
-            f"OTX_MAX_LIST_PAGES={config.OTX_MAX_LIST_PAGES}"
+            f"OTX_MAX_LIST_PAGES={config.OTX_MAX_LIST_PAGES}, "
+            f"MAX_INDICATORS_PER_PULSE={config.MAX_INDICATORS_PER_PULSE}"
         )
         logging.info("Main function is now ready to initialize clients.")
 
         logging.info(
-            f"Configured to push a maximum of {config.MAX_BUNDLES_TO_PUSH} new STIX bundles to TAXII per run."
+            f"Configured to push a maximum of {config.MAX_BUNDLES_TO_PUSH} new STIX bundles to TAXII per run. "
+            f"(Each pulse may produce multiple chunks when it has more than "
+            f"MAX_INDICATORS_PER_PULSE={config.MAX_INDICATORS_PER_PULSE} indicators.)"
         )
 
         taxii_client = TAXIIClient(

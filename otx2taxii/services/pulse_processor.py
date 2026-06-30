@@ -141,11 +141,11 @@ class PulseProcessor:
         return escaped
 
     def process_pulse_data(
-        self, 
-        pulse_detail: dict, 
-        pulse_indicators: list[dict], 
+        self,
+        pulse_detail: dict,
+        pulse_indicators: list[dict],
         existing_stix_ids: set[str]
-    ) -> Bundle | None:
+    ) -> list[Bundle]:
         """
         Transforms an OTX pulse and its indicators into a STIX Bundle.
         Performs de-duplication checks based on existing_stix_ids.
@@ -156,8 +156,8 @@ class PulseProcessor:
             existing_stix_ids (set[str]): A set of STIX object IDs already present in the TAXII collection.
 
         Returns:
-            Bundle | None: A STIX Bundle containing the transformed objects, or None if the grouping
-                           for this pulse already exists in the TAXII collection.
+            list[Bundle]: One Bundle per chunk. Empty list if all chunks already exist in TAXII.
+                          Returns a single-element list when the pulse fits in one chunk (backwards compatible).
         """
         pulse_id = pulse_detail.get('id')
         pulse_name = pulse_detail.get('name', 'Unknown Pulse')
@@ -170,7 +170,13 @@ class PulseProcessor:
         stix_tlp_ref = self._map_tlp_to_stix(pulse_tlp_str)
 
         all_stix_objects = []
-        processed_indicator_ids = []
+        # processed_indicators holds (stix_id, Indicator_or_None) tuples.
+        # - (id, Indicator) when we built a new indicator that needs to be
+        #   pushed in a chunk's bundle.
+        # - (id, None) when the indicator already exists in TAXII; we still
+        #   need its ID for the Grouping's object_refs but we don't re-push
+        #   the body.
+        processed_indicators: list[tuple[str, "Indicator | None"]] = []
 
         logger.info(f"\n--- Processing Pulse ID: {pulse_id} ('{pulse_name}' by '{pulse_author}') ---")
 
@@ -294,8 +300,7 @@ class PulseProcessor:
                                     object_marking_refs=[stix_tlp_ref],
                                     pattern_version="2.1" # Explicitly set pattern version for STIX 2.1
                                 )
-                                all_stix_objects.append(stix_indicator)
-                                processed_indicator_ids.append(stix_indicator.id)
+                                processed_indicators.append((stix_indicator.id, stix_indicator))
                                 logger.debug(f"Converted and added STIX Indicator: {stix_indicator.id}")
                             except Exception as stix_error:
                                 logger.error(f"Failed to create STIX indicator for '{sanitized_value}' (type: {indicator_type_otx})")
@@ -309,7 +314,7 @@ class PulseProcessor:
                             logger.info(f"Indicator '{sanitized_value}' (ID: {proposed_indicator_id}) already exists in TAXII. Skipping.")
                             # Even if the indicator exists, we still want to link it to the grouping.
                             # So, add its ID to processed_indicator_ids if it's already in existing_stix_ids
-                            processed_indicator_ids.append(proposed_indicator_id)
+                            processed_indicators.append((proposed_indicator_id, None))
 
                     except Exception as e:
                         logger.error(f"Error processing indicator '{sanitized_value}' (original: '{indicator_value}') from pulse '{pulse_name}': {e}")
@@ -318,42 +323,129 @@ class PulseProcessor:
                             logger.error("This appears to be a STIX pattern validation error. The indicator value may contain invalid characters.")
                         continue
                 
-        # --- Create Grouping Object ---
-        # Generate a consistent STIX ID for the grouping using the namespace
-        # We include the sorted list of object refs in the hash to make it unique per set of indicators
-        all_refs_for_grouping_hash = [str(self.otx_identity.id),] + sorted(processed_indicator_ids)
-        grouping_hash_data = f"otx_pulse-{pulse_id}-{pulse_name}-{pulse_description}-{'|'.join(all_refs_for_grouping_hash)}"
-        stix_grouping_id_det = uuid.uuid5(self.custom_stix_namespace, grouping_hash_data)
-        proposed_grouping_id = f"grouping--{str(stix_grouping_id_det)}"
-        
-        if proposed_grouping_id in existing_stix_ids:
-            logger.info(f"Grouping for Pulse '{pulse_name}' (ID: {proposed_grouping_id}) already exists in TAXII Server. Skipping this pulse.")
-            return None # Indicate that no new bundle needs to be pushed for this pulse
-        
-        # If we reach here, the grouping does not exist, so create it and its associated objects
-        stix_grouping = Grouping(
-            type="grouping",
-            spec_version="2.1",
-            id=proposed_grouping_id,
-            created_by_ref=self.otx_identity.id,
-            created=pulse_created_dt,
-            modified=pulse_created_dt,
-            name=f"{pulse_name}",
-            context=["threat-report", "otx-pulse"], # Add 'otx-pulse' context for clarity
-            object_refs=[self.otx_identity.id] + processed_indicator_ids,
-        )
-        all_stix_objects.append(stix_grouping)
-        logger.info(f"Created Grouping SDO: {stix_grouping.id} for Pulse '{pulse_name}'")
-        
-        if not all_stix_objects:
-            logger.warning("No STIX Objects were generated for this pulse (after de-duplication checks). Skipping bundle creation.")
-            return None
+        # --- Chunking + Grouping + Bundle Construction ---
+        #
+        # When MAX_INDICATORS_PER_PULSE > 0 and the pulse has more than
+        # that many indicators, we split the indicators into chunks and
+        # produce ONE STIX Bundle PER CHUNK. Each chunk gets:
+        #   - its own unique Grouping SDO (deterministic ID per chunk)
+        #   - a Grouping name of "{pulse_name} - {idx}/{total_chunks}"
+        #
+        # Why unique Grouping IDs: the existing code derives the grouping
+        # ID from the SORTED list of indicator IDs. With chunking, two
+        # different chunks would produce different sorted lists -> different
+        # IDs. That is exactly what we want -- each chunk is an independent
+        # grouping, and TAXII will accept them all.
+        #
+        # When MAX_INDICATORS_PER_PULSE=0 or the pulse has fewer indicators
+        # than the cap, this produces exactly ONE chunk (backwards
+        # compatible with the original single-bundle behaviour).
 
-        # --- Create STIX Bundle ---
-        bundle = Bundle(
-            type="bundle",
-            id=f"bundle--{str(uuid.uuid4())}", # Bundles usually get a new UUID each time
-            objects=all_stix_objects,
-        )
-        logger.info(f"Successfully created STIX Bundle with {len(all_stix_objects)} objects for Pulse '{pulse_name}'.")
-        return bundle
+        import os as _os
+        try:
+            chunk_size = int(_os.getenv("MAX_INDICATORS_PER_PULSE", "200"))
+        except ValueError:
+            chunk_size = 200
+
+        # If chunk_size is 0 or negative, treat as "no chunking" = single bundle.
+        if chunk_size <= 0:
+            chunk_size = max(1, len(processed_indicators))
+
+        # If we have no indicators at all (e.g., all got filtered out by
+        # sanitization), still produce one bundle with just the identity
+        # so we don't drop the pulse silently.
+        if not processed_indicators:
+            chunks: list[list[tuple[str, "Indicator | None"]]] = [[]]
+        else:
+            chunks = [
+                processed_indicators[i : i + chunk_size]
+                for i in range(0, len(processed_indicators), chunk_size)
+            ]
+        total_chunks = len(chunks)
+
+        if total_chunks > 1:
+            logger.info(
+                f"[{pulse_id}] Pulse '{pulse_name}' will be split into "
+                f"{total_chunks} chunks ({len(processed_indicators)} indicators / "
+                f"chunk_size={chunk_size})."
+            )
+
+        # Build one Bundle per chunk.
+        bundles: list[Bundle] = []
+        for chunk_idx, chunk_indicator_tuples in enumerate(chunks, start=1):
+            chunk_indicator_ids = [iid for (iid, _) in chunk_indicator_tuples]
+            chunk_indicator_objects = [
+                obj for (_, obj) in chunk_indicator_tuples if obj is not None
+            ]
+
+            # Deterministic, unique grouping ID per chunk.
+            chunk_refs_for_hash = sorted(chunk_indicator_ids)
+            grouping_hash_data = (
+                f"otx_pulse-{pulse_id}"
+                f"-chunk-{chunk_idx}-of-{total_chunks}"
+                f"-{'|'.join(chunk_refs_for_hash)}"
+            )
+            stix_grouping_id_det = uuid.uuid5(
+                self.custom_stix_namespace, grouping_hash_data
+            )
+            proposed_grouping_id = f"grouping--{str(stix_grouping_id_det)}"
+
+            if proposed_grouping_id in existing_stix_ids:
+                logger.info(
+                    f"[{pulse_id}] Grouping chunk {chunk_idx}/{total_chunks} "
+                    f"({proposed_grouping_id}) already exists in TAXII. Skipping."
+                )
+                continue
+
+            # Grouping name with the "1/3" suffix as requested.
+            chunk_name = (
+                f"{pulse_name} - {chunk_idx}/{total_chunks}"
+                if total_chunks > 1
+                else pulse_name
+            )
+
+            chunk_objects: list = []
+            # Add the OTX identity to the FIRST chunk only when it's not
+            # already in TAXII. Subsequent chunks rely on the identity
+            # already being there from chunk 1.
+            if chunk_idx == 1 and self.otx_identity.id not in existing_stix_ids:
+                chunk_objects.append(self.otx_identity)
+
+            # Add the new Indicator objects for THIS chunk only.
+            chunk_objects.extend(chunk_indicator_objects)
+
+            stix_grouping = Grouping(
+                type="grouping",
+                spec_version="2.1",
+                id=proposed_grouping_id,
+                created_by_ref=self.otx_identity.id,
+                created=pulse_created_dt,
+                modified=pulse_created_dt,
+                name=chunk_name,
+                context=["threat-report", "otx-pulse"],
+                object_refs=[self.otx_identity.id] + chunk_indicator_ids,
+            )
+            chunk_objects.append(stix_grouping)
+
+            bundle = Bundle(
+                type="bundle",
+                id=f"bundle--{str(uuid.uuid4())}",
+                objects=chunk_objects,
+            )
+            bundles.append(bundle)
+            logger.info(
+                f"[{pulse_id}] Built chunk {chunk_idx}/{total_chunks} "
+                f"with {len(chunk_indicator_ids)} indicators "
+                f"({len(chunk_indicator_objects)} new + "
+                f"{len(chunk_indicator_ids) - len(chunk_indicator_objects)} existing): "
+                f"{chunk_name} (grouping={stix_grouping.id})"
+            )
+
+        if not bundles:
+            logger.info(
+                f"[{pulse_id}] All chunks for pulse '{pulse_name}' already exist "
+                "in TAXII. Nothing to push."
+            )
+            return []
+
+        return bundles
