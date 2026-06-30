@@ -34,6 +34,20 @@ def signal_handler(signum, frame):
     shutdown_requested = True
 
 
+def _interruptible_sleep(total_seconds: int) -> None:
+    """
+    Sleep `total_seconds` in small chunks so SIGINT/SIGTERM is honoured
+    within at most 1 second. Without this, a long `time.sleep(...)`
+    between scheduler cycles would block the shutdown signal handler
+    from being processed promptly.
+    """
+    remaining = max(0, int(total_seconds))
+    while remaining > 0 and not shutdown_requested:
+        chunk = min(1, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+
+
 def _process_single_pulse(
     pulse_detail: dict,
     config,
@@ -345,29 +359,61 @@ def main():
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
-        try:
-            process_otx_to_taxii(
-                config, otx_client, taxii_client, pulse_processor, existing_stix_ids
+        # ------------------------------------------------------------------
+        # Scheduler loop.
+        #
+        # The container's restart policy + a 10-second SCHEDULER_INTERVAL_SECONDS
+        # caused a tight death loop where the process would restart as soon as
+        # it exited cleanly, reloading the entire SDK + cache every cycle. That
+        # alone pegged CPU/RAM on small VMs.
+        #
+        # The fix is to keep the process alive in-process and sleep between
+        # cycles. The loop respects:
+        #   - SIGINT / SIGTERM (graceful shutdown via shutdown_requested flag)
+        #   - OTXAPIUnavailable (long back-off, then resume)
+        #   - Any other exception (log + continue, don't exit on transient errors)
+        # ------------------------------------------------------------------
+        cycle = 0
+        while not shutdown_requested:
+            cycle += 1
+            logging.info(f"========== Scheduler cycle #{cycle} starting ==========")
+            try:
+                # Refresh the de-dup snapshot each cycle: TAXII may have
+                # accumulated new IDs since the last cycle.
+                existing_stix_ids = taxii_client.get_existing_stix_ids()
+                process_otx_to_taxii(
+                    config,
+                    otx_client,
+                    taxii_client,
+                    pulse_processor,
+                    existing_stix_ids,
+                )
+                logging.info(f"Cycle #{cycle} complete.")
+            except OTXAPIUnavailable as e:
+                logging.error(
+                    f"OTX API unavailable in cycle #{cycle}: {e}. "
+                    "Backing off for 300s before next attempt."
+                )
+                _interruptible_sleep(300)
+                continue
+            except Exception as e:
+                logging.error(
+                    f"Error in scheduler cycle #{cycle}: {e}",
+                    exc_info=True,
+                )
+                # Don't exit on transient errors — sleep then retry.
+                _interruptible_sleep(min(60, config.SCHEDULER_INTERVAL_SECONDS))
+                continue
+
+            # Sleep between cycles (interruptible so SIGTERM exits promptly).
+            logging.info(
+                f"Sleeping {config.SCHEDULER_INTERVAL_SECONDS}s before next cycle "
+                "(SIGINT/SIGTERM to exit immediately)."
             )
-            logging.info("One-shot cycle complete. Exiting with status 0.")
-            sys.exit(0)
-        except OTXAPIUnavailable as e:
-            # Upstream OTX API is down or rate-limiting us. Don't hammer it.
-            # Sleep for 5 minutes before exiting so Docker's restart policy
-            # gives the upstream time to recover instead of looping every 30s.
-            logging.error(
-                f"OTX API is unavailable: {e}. Sleeping 300s before exit "
-                "to back off and let the upstream recover."
-            )
-            time.sleep(300)
-            logging.error(
-                "One-shot cycle failed (OTX unavailable). Exiting with status 1."
-            )
-            sys.exit(1)
-        except Exception as e:
-            logging.error(f"Error in main processing loop: {e}", exc_info=True)
-            logging.error("One-shot cycle failed. Exiting with status 1.")
-            sys.exit(1)
+            _interruptible_sleep(config.SCHEDULER_INTERVAL_SECONDS)
+
+        logging.info("Shutdown requested. Exiting with status 0.")
+        sys.exit(0)
 
     except ValueError as ve:
         logging.critical(
