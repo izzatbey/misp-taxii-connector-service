@@ -7,10 +7,85 @@ import datetime
 import pytz
 import requests
 import json
+import shutil
+import threading
+import time
 
 from clients.redis_utility import RedisClient
 
 logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------------
+# Module-level throttle for outbound OTX HTTPS calls.
+# ----------------------------------------------------------------------
+# A single semaphore shared across all OTXClient instances so that
+# concurrent workers cannot collectively hammer the OTX API. The delay
+# is applied per-request to flatten CPU spikes during bursty fetches.
+# These are populated lazily on first use from env vars so we don't
+# need a constructor arg change.
+_otx_request_semaphore: threading.Semaphore | None = None
+_otx_request_semaphore_lock = threading.Lock()
+_otx_request_delay_seconds: float = 0.0
+_otx_list_page_delay_seconds: float = 0.0
+_otx_max_list_pages: int = 0
+
+
+def _get_otx_request_semaphore() -> threading.Semaphore:
+    """Lazily build (and cache) the module-level OTX request semaphore."""
+    global _otx_request_semaphore, _otx_request_delay_seconds
+    global _otx_list_page_delay_seconds, _otx_max_list_pages
+    if _otx_request_semaphore is None:
+        with _otx_request_semaphore_lock:
+            if _otx_request_semaphore is None:
+                try:
+                    max_concurrent = max(
+                        1, int(os.getenv("OTX_MAX_CONCURRENT_REQUESTS", "1"))
+                    )
+                except ValueError:
+                    max_concurrent = 1
+                try:
+                    _otx_request_delay_seconds = max(
+                        0.0, float(os.getenv("OTX_REQUEST_DELAY_SECONDS", "0.5"))
+                    )
+                except ValueError:
+                    _otx_request_delay_seconds = 0.5
+                try:
+                    _otx_list_page_delay_seconds = max(
+                        0.0, float(os.getenv("OTX_LIST_PAGE_DELAY_SECONDS", "1.0"))
+                    )
+                except ValueError:
+                    _otx_list_page_delay_seconds = 1.0
+                try:
+                    _otx_max_list_pages = max(
+                        0, int(os.getenv("OTX_MAX_LIST_PAGES", "0"))
+                    )
+                except ValueError:
+                    _otx_max_list_pages = 0
+                _otx_request_semaphore = threading.Semaphore(max_concurrent)
+                logger.info(
+                    "OTX request throttle initialised: max_concurrent=%d, "
+                    "request_delay=%.2fs, list_page_delay=%.2fs, max_list_pages=%d",
+                    max_concurrent,
+                    _otx_request_delay_seconds,
+                    _otx_list_page_delay_seconds,
+                    _otx_max_list_pages,
+                )
+    return _otx_request_semaphore
+
+
+def _sleep_after_request() -> None:
+    """Sleep OTX_REQUEST_DELAY_SECONDS after a single OTX HTTPS call."""
+    # Make sure the throttling knobs are initialised first.
+    _get_otx_request_semaphore()
+    if _otx_request_delay_seconds > 0:
+        time.sleep(_otx_request_delay_seconds)
+
+
+def _sleep_between_list_pages() -> None:
+    """Sleep OTX_LIST_PAGE_DELAY_SECONDS between OTX list-page fetches."""
+    _get_otx_request_semaphore()
+    if _otx_list_page_delay_seconds > 0:
+        time.sleep(_otx_list_page_delay_seconds)
 
 
 class FilteredOTXv2Cached(OTXv2Cached):
@@ -89,9 +164,45 @@ class OTXClient:
         otx_cache_dir = os.getenv(
             "OTX_CACHE_DIR", os.path.expanduser("~/.otx_cache_data")
         )
+
+        # Optional: blow away the on-disk OTX cache once if requested.
+        # Useful when the cache has grown to thousands of files and
+        # `update()` is slow because it walks + re-parses every JSON file.
+        clear_cache_on_start = os.getenv(
+            "OTX_CACHE_CLEAR_ON_START", "false"
+        ).lower() in (
+            "true",
+            "1",
+            "t",
+            "y",
+            "yes",
+        )
+        if clear_cache_on_start and os.path.isdir(otx_cache_dir):
+            try:
+                shutil.rmtree(otx_cache_dir)
+                logger.warning(
+                    f"OTX_CACHE_CLEAR_ON_START=true — removed cache directory: {otx_cache_dir}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to clear OTX cache directory {otx_cache_dir}: {e}",
+                    exc_info=True,
+                )
+
         self.otx = FilteredOTXv2Cached(
             api_key, allowed_authors=allowed_authors, cache_dir=otx_cache_dir
         )
+
+        # Monkey-patch the SDK's pagination walker so that every page fetch
+        # is gated by the OTX request semaphore + a delay between pages.
+        # This keeps bulk `update()` + `getall()` walks from hammering
+        # OTX or pegging the CPU when there are 50+ pages to walk.
+        try:
+            max_list_pages = max(0, int(os.getenv("OTX_MAX_LIST_PAGES", "0")))
+        except ValueError:
+            max_list_pages = 0
+        self._install_walkapi_throttle(max_list_pages=max_list_pages)
+
         logger.info(
             f"OTX Client initialized with FilteredOTXv2Cached. Cache directory: {otx_cache_dir}"
         )
@@ -445,48 +556,146 @@ class OTXClient:
             logger.error(f"Error analyzing author statistics: {e}", exc_info=True)
             return {}
 
+    def _install_walkapi_throttle(self, max_list_pages: int = 0) -> None:
+        """
+        Monkey-patch the SDK's `walkapi_iter` (used by `getall()` and
+        `update()`) so that each paginated HTTPS call is:
+
+          1. Gated by the module-level OTX request semaphore, and
+          2. Followed by a sleep between list pages.
+
+        This throttles long bulk fetches without changing the SDK. We
+        keep a reference to the original so we can restore it on
+        teardown if needed (kept here for testability).
+
+        Args:
+            max_list_pages: If > 0, stop walking after this many pages.
+        """
+        original = getattr(self.otx, "walkapi_iter", None)
+        if original is None:
+            logger.warning(
+                "OTXv2 SDK does not expose walkapi_iter — skipping list-page throttle install."
+            )
+            return
+
+        sem = _get_otx_request_semaphore()
+
+        def throttled_walkapi_iter(url, params=None, headers=None, **kwargs):
+            """Generator that yields items from paginated OTX endpoints,
+            throttling each page request via the OTX semaphore + delay.
+            """
+            page_count = 0
+            current_url = url
+            current_params = params
+            current_headers = headers
+            while current_url is not None:
+                if max_list_pages > 0 and page_count >= max_list_pages:
+                    logger.info(
+                        f"Reached OTX_MAX_LIST_PAGES={max_list_pages}; stopping page walk."
+                    )
+                    break
+                with sem:
+                    try:
+                        page = original(
+                            current_url,
+                            params=current_params,
+                            headers=current_headers,
+                            **kwargs,
+                        )
+                        # The original returns a tuple (next_url, data)
+                        next_url, data = page
+                    except Exception as e:
+                        logger.error(
+                            f"Error during throttled OTX page fetch ({current_url}): {e}",
+                            exc_info=True,
+                        )
+                        raise
+                page_count += 1
+                _sleep_between_list_pages()
+                # OTXv2's walkapi_iter is itself a generator; we need to
+                # iterate the returned `data` (which may be a generator
+                # or list) and yield each item, then continue pagination.
+                if hasattr(data, "__iter__") and not isinstance(
+                    data, (dict, str, bytes)
+                ):
+                    for item in data:
+                        yield item
+                else:
+                    # Single object response
+                    yield data
+                current_url = next_url
+                current_params = None  # next_url is fully qualified
+                current_headers = None
+
+        # Bind to the instance so it shadows the SDK method.
+        # Use setattr so we don't depend on subclass method-resolution quirks.
+        try:
+            self.otx.walkapi_iter = throttled_walkapi_iter
+            logger.info(
+                f"Installed throttled walkapi_iter on OTX client "
+                f"(max_list_pages={max_list_pages})."
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to install walkapi_iter throttle: {e}",
+                exc_info=True,
+            )
+
     def get_pulse_indicators(self, pulse_id: str) -> list[dict]:
         """
         Retrieves all indicators for a specific OTX pulse.
         This uses OTXv2Cached's get_pulse_details, which likely hits API for non-cached details.
+
+        The outbound HTTPS call is gated by a module-level semaphore
+        (OTX_MAX_CONCURRENT_REQUESTS) and followed by a small sleep
+        (OTX_REQUEST_DELAY_SECONDS) to keep CPU/RAM usage bounded on
+        small VMs and avoid OTX rate-limits.
         """
         logger.info(f"Fetching indicators for pulse ID: {pulse_id}...")
+        sem = _get_otx_request_semaphore()
         try:
-            pulse_details = self.otx.get_pulse_details(pulse_id)
-            if pulse_details and "indicators" in pulse_details:
-                logger.info(
-                    f"Retrieved {len(pulse_details['indicators'])} indicators for pulse ID: {pulse_id}."
-                )
-                return pulse_details["indicators"]
-            else:
-                logger.warning(
-                    f"No indicators found or pulse details incomplete for ID: {pulse_id}."
-                )
-                return []
+            with sem:
+                pulse_details = self.otx.get_pulse_details(pulse_id)
         except requests.exceptions.Timeout as e:
             logger.error(
                 f"OTX API request for pulse {pulse_id} details timed out after 30 seconds: {e}.",
                 exc_info=True,
             )
+            _sleep_after_request()
             return []
         except requests.exceptions.ConnectionError as e:
             logger.error(
                 f"Failed to connect to OTX API for pulse {pulse_id} details: {e}.",
                 exc_info=True,
             )
+            _sleep_after_request()
             return []
         except requests.exceptions.RequestException as e:
             logger.error(
                 f"An HTTP error occurred retrieving pulse {pulse_id} details: {e}",
                 exc_info=True,
             )
+            _sleep_after_request()
             return []
         except Exception as e:
             logger.error(
                 f"An unexpected error occurred while retrieving indicators for pulse {pulse_id}: {e}",
                 exc_info=True,
             )
+            _sleep_after_request()
             return []
+
+        _sleep_after_request()
+
+        if pulse_details and "indicators" in pulse_details:
+            logger.info(
+                f"Retrieved {len(pulse_details['indicators'])} indicators for pulse ID: {pulse_id}."
+            )
+            return pulse_details["indicators"]
+        logger.warning(
+            f"No indicators found or pulse details incomplete for ID: {pulse_id}."
+        )
+        return []
 
     def _cache_pulse(self, pulse: dict):
         """Store a pulse in Redis cache"""

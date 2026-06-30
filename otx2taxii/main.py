@@ -292,6 +292,14 @@ def main():
         )
         logging.info(f"Max Bundles to Push: {config.MAX_BUNDLES_TO_PUSH}")
         logging.info(f"Scheduler Interval: {config.SCHEDULER_INTERVAL_SECONDS} seconds")
+        logging.info(
+            f"Resource throttling: MAX_WORKERS={config.MAX_WORKERS}, "
+            f"OTX_MAX_CONCURRENT_REQUESTS={config.OTX_MAX_CONCURRENT_REQUESTS}, "
+            f"OTX_REQUEST_DELAY_SECONDS={config.OTX_REQUEST_DELAY_SECONDS}, "
+            f"OTX_LIST_PAGE_DELAY_SECONDS={config.OTX_LIST_PAGE_DELAY_SECONDS}, "
+            f"OTX_CACHE_CLEAR_ON_START={config.OTX_CACHE_CLEAR_ON_START}, "
+            f"OTX_MAX_LIST_PAGES={config.OTX_MAX_LIST_PAGES}"
+        )
         logging.info("Main function is now ready to initialize clients.")
 
         logging.info(

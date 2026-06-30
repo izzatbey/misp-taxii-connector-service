@@ -49,7 +49,51 @@ class Config:
         # Maximum number of worker threads used to process OTX pulses concurrently
         # inside process_otx_to_taxii(). Increase for faster throughput on large
         # pulse sets; decrease if you hit TAXII rate-limits or Redis contention.
-        self.MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
+        # Default lowered from 6 to 2 to keep CPU/RAM usage low on small VMs.
+        self.MAX_WORKERS = int(os.getenv("MAX_WORKERS", "2"))
+
+        # ------------------------------------------------------------------
+        # Resource-throttling knobs (added to keep CPU/RAM usage bounded on
+        # small VMs). All values are tunable via .env without code changes.
+        # ------------------------------------------------------------------
+
+        # Maximum number of CONCURRENT outbound HTTPS requests to the OTX API
+        # at any given moment. Independent of MAX_WORKERS — workers may run
+        # STIX build / Redis / TAXII work concurrently but must take this
+        # semaphore before each OTX HTTP call. Default 1 = fully serialised.
+        # Increase to 2–3 if OTX rate-limits are not a concern.
+        self.OTX_MAX_CONCURRENT_REQUESTS = int(
+            os.getenv("OTX_MAX_CONCURRENT_REQUESTS", "1")
+        )
+
+        # Sleep added after every outbound OTX HTTP call (seconds). Stacks
+        # on top of the semaphore to give the upstream API breathing room
+        # and to flatten CPU spikes during bursty list-page fetches.
+        # Default 0.5s = at most ~2 OTX calls/sec.
+        self.OTX_REQUEST_DELAY_SECONDS = float(
+            os.getenv("OTX_REQUEST_DELAY_SECONDS", "0.5")
+        )
+
+        # Sleep between sequential OTX list-page fetches during
+        # OTXv2Cached.update() (seconds). Page walks for the subscribed
+        # feed can be long (50+ pages); this throttle keeps memory and CPU
+        # low while still letting the cache warm up.
+        self.OTX_LIST_PAGE_DELAY_SECONDS = float(
+            os.getenv("OTX_LIST_PAGE_DELAY_SECONDS", "1.0")
+        )
+
+        # Optional: clear the bloated on-disk OTX cache (~/.otx_cache_data)
+        # at the start of every run. Useful if the cache has grown huge
+        # over time and `update()` is slow because it walks thousands of
+        # JSON files. Default false; set true once to reset.
+        self.OTX_CACHE_CLEAR_ON_START = self._parse_boolean(
+            os.getenv("OTX_CACHE_CLEAR_ON_START", "false")
+        )
+
+        # Optional cap on the number of OTX list pages to walk during a
+        # single run. Default 0 = unlimited. Useful if OTX keeps returning
+        # very deep pages. Set to e.g. 30 to cap to ~30 pages.
+        self.OTX_MAX_LIST_PAGES = int(os.getenv("OTX_MAX_LIST_PAGES", "0"))
 
         # OTX Author Filter Configuration
         # If set to a comma-separated list of author names, only pulses from
