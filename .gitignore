@@ -62,3 +62,4 @@ logs/
 *.tmp
 *.orig
 *.rej
+PLAN.md

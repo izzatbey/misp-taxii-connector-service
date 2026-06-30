@@ -104,6 +104,33 @@ class Config:
             os.getenv("MAX_INDICATORS_PER_PULSE", "200")
         )
 
+        # ------------------------------------------------------------------
+        # Outbox / two-process architecture knobs.
+        #
+        # When ENABLE_OUTBOX_MODE=true, ingest.py writes STIX chunk
+        # bundles as JSON files into <STIX_OUTBOX_DIR>/pending/, and
+        # main.py reads them and pushes them to TAXII. This decouples
+        # OTX ingestion (RAM-heavy due to on-disk cache walks) from
+        # TAXII pushing, allowing each process to stay under ~100 MB
+        # peak RAM instead of the previous 14 GB.
+        #
+        # When ENABLE_OUTBOX_MODE=false, the old single-process path
+        # is used (kept for backwards compatibility / quick fallback).
+        # ------------------------------------------------------------------
+        self.ENABLE_OUTBOX_MODE = self._parse_boolean(
+            os.getenv("ENABLE_OUTBOX_MODE", "true")
+        )
+        self.STIX_OUTBOX_DIR = os.getenv(
+            "STIX_OUTBOX_DIR", os.path.join(os.getcwd(), "stix_outbox")
+        )
+        # How often ingest.py re-runs when --loop is used.
+        self.INGEST_INTERVAL_SECONDS = int(os.getenv("INGEST_INTERVAL_SECONDS", "3600"))
+        # How long to back off if OTX is unavailable.
+        self.OTX_BACKOFF_SECONDS = int(os.getenv("OTX_BACKOFF_SECONDS", "300"))
+        # How long to keep processed chunks on disk before auto-deleting
+        # them. 0 = keep forever. Default 7 days.
+        self.OUTBOX_RETENTION_DAYS = int(os.getenv("OUTBOX_RETENTION_DAYS", "7"))
+
         # OTX Author Filter Configuration
         # If set to a comma-separated list of author names, only pulses from
         # those authors will be processed. Matching is case-insensitive and

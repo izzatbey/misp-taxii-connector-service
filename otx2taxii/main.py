@@ -355,6 +355,271 @@ def process_otx_to_taxii(
         )
 
 
+# =============================================================================
+# Outbox-mode path (the new two-process architecture).
+#
+# main.py in outbox mode does NOT touch OTX. It only:
+#   1. Scans <STIX_OUTBOX_DIR>/pending/ for chunk JSON files written by ingest.py
+#   2. Pushes each chunk to TAXII
+#   3. On success: moves file from pending/ → processed/
+#   4. On failure: leaves file in pending/ for next-cycle retry
+#
+# This keeps RAM bounded to ONE chunk at a time (~2-5 MB) instead of all
+# pulses in memory. The OTX ingest process (ingest.py) handles the heavy
+# lifting separately.
+# =============================================================================
+
+
+def _list_outbox_chunks(pending_dir: str) -> list[str]:
+    """
+    Return sorted list of chunk JSON paths in the pending dir.
+
+    Sorted by (pulse_id, chunk_idx) so chunks of the same pulse are pushed
+    in order. This isn't strictly required by TAXII (the server will accept
+    them in any order), but it makes logs nicer and avoids a "chunk 3 of 3"
+    arriving before "chunk 1 of 3" if files were written out of order.
+    """
+    if not os.path.isdir(pending_dir):
+        return []
+    paths = [
+        os.path.join(pending_dir, f)
+        for f in os.listdir(pending_dir)
+        if f.endswith(".json") and not f.endswith(".tmp")
+    ]
+    # Sort by filename (which embeds pulse_id__chunk_idx__chunk_total).
+    paths.sort()
+    return paths
+
+
+def _cleanup_processed_outbox(processed_dir: str, retention_days: int) -> None:
+    """
+    Delete files from <processed_dir> older than retention_days.
+
+    Default 7 days. Set OUTBOX_RETENTION_DAYS=0 to disable cleanup entirely.
+    """
+    if retention_days <= 0:
+        return
+    cutoff = time.time() - (retention_days * 86400)
+    deleted = 0
+    try:
+        for fname in os.listdir(processed_dir):
+            fpath = os.path.join(processed_dir, fname)
+            try:
+                if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                    os.remove(fpath)
+                    deleted += 1
+            except OSError as e:
+                logging.warning(f"Could not delete old outbox file {fpath}: {e}")
+    except OSError as e:
+        logging.warning(f"Could not list processed outbox dir {processed_dir}: {e}")
+    if deleted:
+        logging.info(
+            f"Cleaned up {deleted} outbox file(s) older than {retention_days} days."
+        )
+
+
+def _push_one_outbox_chunk(
+    config,
+    taxii_client,
+    otx_client,
+    pending_dir: str,
+    processed_dir: str,
+    chunk_path: str,
+) -> tuple[bool, bool, str, int, int]:
+    """
+    Read one chunk JSON file, push to TAXII, move to processed/ on success.
+
+    Returns (push_success, processed_success, pulse_id, chunk_idx, chunk_total).
+    """
+    push_success = False
+    processed_success = False
+    pulse_id = "?"
+    chunk_idx = 0
+    chunk_total = 0
+
+    try:
+        with open(chunk_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        pulse_id = str(payload.get("pulse_id", "?"))
+        chunk_idx = int(payload.get("chunk_idx", 0))
+        chunk_total = int(payload.get("chunk_total", 0))
+        indicator_count = int(payload.get("indicator_count", 0))
+        bundle_dict = payload.get("stix_bundle", {})
+
+        if not bundle_dict or "objects" not in bundle_dict:
+            logging.warning(
+                f"[main] Chunk {os.path.basename(chunk_path)} has empty/invalid bundle. "
+                "Moving to processed/ to skip."
+            )
+            # Treat as processed so we don't loop on it forever.
+            try:
+                os.replace(
+                    chunk_path,
+                    os.path.join(processed_dir, os.path.basename(chunk_path)),
+                )
+            except OSError:
+                pass
+            return False, True, pulse_id, chunk_idx, chunk_total
+
+        processed_success = True  # We have a valid bundle to push.
+
+        chunk_label = (
+            f"chunk {chunk_idx}/{chunk_total}" if chunk_total > 1 else "bundle"
+        )
+        logging.info(
+            f"[Pulse {pulse_id}] Pushing {chunk_label} "
+            f"({indicator_count} indicators) to TAXII..."
+        )
+
+        # Pre-validate against TAXII (if enabled) to skip all-duplicate chunks.
+        bundle_to_push = bundle_dict
+        if config.ENABLE_CACHE_PREVALIDATION:
+            original_count = len(bundle_dict.get("objects", []))
+            bundle_to_push = taxii_client.pre_validate_bundle_objects(bundle_dict)
+            validated_count = len(bundle_to_push.get("objects", []))
+            if validated_count == 0:
+                logging.info(
+                    f"[Pulse {pulse_id}] {chunk_label}: all objects are duplicates. "
+                    "Moving to processed/ without pushing."
+                )
+                os.replace(
+                    chunk_path,
+                    os.path.join(processed_dir, os.path.basename(chunk_path)),
+                )
+                # Count as "pushed" (we're done with it).
+                return True, True, pulse_id, chunk_idx, chunk_total
+            elif validated_count < original_count:
+                logging.info(
+                    f"[Pulse {pulse_id}] {chunk_label} pre-validation: "
+                    f"{original_count} → {validated_count} objects "
+                    f"(removed {original_count - validated_count} duplicates)"
+                )
+
+        if config.ENABLE_CACHE_PREVALIDATION:
+            for obj in bundle_to_push.get("objects", []):
+                if "id" in obj:
+                    otx_client.cache_stix_uuid(obj["id"], pulse_id)
+
+        if taxii_client.add_stix_bundle(bundle_to_push):
+            push_success = True
+            logging.info(f"[Pulse {pulse_id}] Successfully pushed {chunk_label}.")
+            # Move the file from pending/ to processed/ so we don't retry.
+            try:
+                os.replace(
+                    chunk_path,
+                    os.path.join(processed_dir, os.path.basename(chunk_path)),
+                )
+            except OSError as e:
+                logging.error(
+                    f"[Pulse {pulse_id}] Pushed OK but could not move "
+                    f"{chunk_path} -> processed/: {e}. Will retry next cycle."
+                )
+                # Return success=False so the next cycle retries — but we
+                # already pushed, so the TAXII server will dedup.
+                push_success = False
+        else:
+            logging.error(
+                f"[Pulse {pulse_id}] Failed to push {chunk_label}. Will retry next cycle."
+            )
+
+    except json.JSONDecodeError as e:
+        logging.error(
+            f"[main] Could not parse chunk file {chunk_path}: {e}. "
+            "Moving to processed/ to skip (corrupt file)."
+        )
+        try:
+            os.replace(
+                chunk_path, os.path.join(processed_dir, os.path.basename(chunk_path))
+            )
+        except OSError:
+            pass
+    except Exception as e:
+        logging.error(
+            f"[main] Error processing chunk {chunk_path}: {e}",
+            exc_info=True,
+        )
+
+    return push_success, processed_success, pulse_id, chunk_idx, chunk_total
+
+
+def process_outbox_to_taxii(config, taxii_client, otx_client) -> None:
+    """
+    Outbox-mode cycle: scan pending/ and push each chunk to TAXII.
+
+    Each chunk is pushed by a worker thread (via the existing thread pool
+    pattern). Capped by MAX_BUNDLES_TO_PUSH (None = unlimited).
+    """
+    pending_dir = os.path.join(config.STIX_OUTBOX_DIR, "pending")
+    processed_dir = os.path.join(config.STIX_OUTBOX_DIR, "processed")
+    os.makedirs(pending_dir, exist_ok=True)
+    os.makedirs(processed_dir, exist_ok=True)
+
+    # Periodic cleanup of processed/ dir.
+    _cleanup_processed_outbox(processed_dir, config.OUTBOX_RETENTION_DAYS)
+
+    chunk_paths = _list_outbox_chunks(pending_dir)
+    if not chunk_paths:
+        logging.info(
+            f"[main/outbox] No chunks pending in {pending_dir}. Nothing to push."
+        )
+        return
+
+    logging.info(
+        f"[main/outbox] Found {len(chunk_paths)} chunk(s) pending. "
+        f"Pushing with {config.MAX_WORKERS} worker(s)..."
+    )
+
+    max_push_limit = config.MAX_BUNDLES_TO_PUSH
+    push_counter_lock = threading.Lock()
+    pushed_so_far = 0
+
+    results = []
+    with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
+        futures = {}
+        for chunk_path in chunk_paths:
+            if max_push_limit is not None:
+                with push_counter_lock:
+                    if pushed_so_far >= max_push_limit:
+                        logging.info(
+                            f"Reached MAX_BUNDLES_TO_PUSH={max_push_limit}. "
+                            "Remaining chunks will be pushed on the next cycle."
+                        )
+                        break
+
+            future = executor.submit(
+                _push_one_outbox_chunk,
+                config,
+                taxii_client,
+                otx_client,
+                pending_dir,
+                processed_dir,
+                chunk_path,
+            )
+            futures[future] = chunk_path
+
+        for future in as_completed(futures):
+            try:
+                push_ok, proc_ok, pid, cidx, ctot = future.result()
+            except Exception as e:
+                logging.error(
+                    f"[main/outbox] Unhandled exception in chunk worker: {e}",
+                    exc_info=True,
+                )
+                push_ok, proc_ok = False, False
+            if push_ok:
+                with push_counter_lock:
+                    pushed_so_far += 1
+            results.append((push_ok, proc_ok))
+
+    processed_count = sum(1 for _, p in results if p)
+    pushed_count = sum(1 for s, _ in results if s)
+    logging.info(
+        f"[main/outbox] Cycle complete: {pushed_count} pushed, "
+        f"{processed_count} processed, {len(results) - processed_count} failed."
+    )
+
+
 def main():
     load_dotenv()
 
@@ -395,6 +660,21 @@ def main():
             f"MAX_INDICATORS_PER_PULSE={config.MAX_INDICATORS_PER_PULSE} indicators.)"
         )
 
+        # ------------------------------------------------------------------
+        # Outbox mode log line — helps operators see which path is active.
+        # ------------------------------------------------------------------
+        if config.ENABLE_OUTBOX_MODE:
+            logging.info(
+                f"[main] OUTBOX MODE IS ON. Reading chunks from "
+                f"{os.path.join(config.STIX_OUTBOX_DIR, 'pending')}. "
+                f"OTX ingestion happens in a separate process (ingest.py)."
+            )
+        else:
+            logging.info(
+                "[main] Outbox mode is OFF. Running the legacy single-process "
+                "OTX → TAXII path. RAM usage may be high."
+            )
+
         taxii_client = TAXIIClient(
             taxii_url=config.TAXII_URL,
             username=config.USERNAME,
@@ -411,14 +691,15 @@ def main():
         collection = taxii_client.get_default_collection()
         logging.info(f"Default Collection: {collection.title} (ID: {collection.id})")
 
-        existing_stix_ids = taxii_client.get_existing_stix_ids()
-        logging.info(
-            f"Retrieved {len(existing_stix_ids)} existing STIX IDs (from cache or TAXII server) for de-duplication."
-        )
-
+        # OTX client is needed in BOTH modes:
+        # - In outbox mode: only for `cache_stix_uuid()` during pre-validation.
+        # - In legacy mode: full OTX fetching + indicator pulling.
+        # The constructor is cheap (just creates a small SDK wrapper); the
+        # RAM-heavy parts (OTXv2Cached disk walk) only happen on first
+        # .update() call.
         otx_client = OTXClient(
             api_key=config.OTX_API_KEY,
-            allowed_authors=config.OTX_AUTHOR_FILTER,  # NEW
+            allowed_authors=config.OTX_AUTHOR_FILTER,
             redis_host=config.REDIS_HOST,
             redis_port=config.REDIS_PORT,
             redis_db=config.REDIS_DB,
@@ -426,50 +707,57 @@ def main():
         )
         logging.info("OTX Client initialized successfully.")
 
-        pulse_processor = PulseProcessor(
-            custom_stix_namespace=config.CUSTOM_STIX_NAMESPACE
-        )
-        logging.info("PulseProcessor initialized successfully.")
+        pulse_processor = None
+        if not config.ENABLE_OUTBOX_MODE:
+            # Only needed in legacy mode for STIX bundle construction.
+            pulse_processor = PulseProcessor(
+                custom_stix_namespace=config.CUSTOM_STIX_NAMESPACE
+            )
+            logging.info("PulseProcessor initialized successfully.")
+        else:
+            logging.info(
+                "[main] Outbox mode: PulseProcessor NOT initialised in this process "
+                "(ingest.py owns it)."
+            )
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
         # ------------------------------------------------------------------
-        # Scheduler loop.
+        # Scheduler loop. Two paths depending on outbox mode.
         #
-        # The container's restart policy + a 10-second SCHEDULER_INTERVAL_SECONDS
-        # caused a tight death loop where the process would restart as soon as
-        # it exited cleanly, reloading the entire SDK + cache every cycle. That
-        # alone pegged CPU/RAM on small VMs.
-        #
-        # The fix is to keep the process alive in-process and sleep between
-        # cycles. The loop respects:
-        #   - SIGINT / SIGTERM (graceful shutdown via shutdown_requested flag)
-        #   - OTXAPIUnavailable (long back-off, then resume)
-        #   - Any other exception (log + continue, don't exit on transient errors)
+        # Both modes use the same in-process loop pattern: stay alive
+        # between cycles (don't sys.exit so Docker doesn't restart us
+        # in a tight loop), honour SIGINT/SIGTERM via the
+        # shutdown_requested flag, sleep an interruptible amount between
+        # cycles.
         # ------------------------------------------------------------------
         cycle = 0
         while not shutdown_requested:
             cycle += 1
             logging.info(f"========== Scheduler cycle #{cycle} starting ==========")
             try:
-                # Refresh the de-dup snapshot each cycle: TAXII may have
-                # accumulated new IDs since the last cycle.
-                existing_stix_ids = taxii_client.get_existing_stix_ids()
-                process_otx_to_taxii(
-                    config,
-                    otx_client,
-                    taxii_client,
-                    pulse_processor,
-                    existing_stix_ids,
-                )
+                if config.ENABLE_OUTBOX_MODE:
+                    # Outbox path: scan pending/ and push each chunk.
+                    process_outbox_to_taxii(config, taxii_client, otx_client)
+                else:
+                    # Legacy path: fetch from OTX and push inline.
+                    existing_stix_ids = taxii_client.get_existing_stix_ids()
+                    process_otx_to_taxii(
+                        config,
+                        otx_client,
+                        taxii_client,
+                        pulse_processor,
+                        existing_stix_ids,
+                    )
                 logging.info(f"Cycle #{cycle} complete.")
             except OTXAPIUnavailable as e:
+                # Only legacy mode can hit OTX directly, but keep the guard.
                 logging.error(
                     f"OTX API unavailable in cycle #{cycle}: {e}. "
-                    "Backing off for 300s before next attempt."
+                    f"Backing off for {config.OTX_BACKOFF_SECONDS}s before next attempt."
                 )
-                _interruptible_sleep(300)
+                _interruptible_sleep(config.OTX_BACKOFF_SECONDS)
                 continue
             except Exception as e:
                 logging.error(
