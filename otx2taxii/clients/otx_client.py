@@ -201,7 +201,7 @@ class OTXClient:
             max_list_pages = max(0, int(os.getenv("OTX_MAX_LIST_PAGES", "0")))
         except ValueError:
             max_list_pages = 0
-        self._install_walkapi_throttle(max_list_pages=max_list_pages)
+        self._install_request_throttle(max_list_pages=max_list_pages)
 
         logger.info(
             f"OTX Client initialized with FilteredOTXv2Cached. Cache directory: {otx_cache_dir}"
@@ -556,88 +556,91 @@ class OTXClient:
             logger.error(f"Error analyzing author statistics: {e}", exc_info=True)
             return {}
 
-    def _install_walkapi_throttle(self, max_list_pages: int = 0) -> None:
+    def _install_request_throttle(self, max_list_pages: int = 0) -> None:
         """
-        Monkey-patch the SDK's `walkapi_iter` (used by `getall()` and
-        `update()`) so that each paginated HTTPS call is:
+        Wrap the OTX SDK's `get()` and `post()` methods with our throttle.
 
-          1. Gated by the module-level OTX request semaphore, and
-          2. Followed by a sleep between list pages.
+        Why `get`/`post` and not `walkapi_iter`? Because `walkapi_iter` is
+        itself a generator that internally calls `self.get(url)` once per
+        page — it has signature `(url, max_page=None, max_items=None,
+        method='GET', body=None)` with no `params`/`headers` kwargs.
+        Wrapping `get()`/`post()` is the cleanest single point of
+        interception: every internal SDK caller (walkapi_iter,
+        get_pulse_details, getall, etc.) funnels through them.
 
-        This throttles long bulk fetches without changing the SDK. We
-        keep a reference to the original so we can restore it on
-        teardown if needed (kept here for testability).
+        The wrapper:
+          1. Acquires the module-level OTX request semaphore (caps
+             concurrent outbound calls to OTX_MAX_CONCURRENT_REQUESTS).
+          2. Calls the original method.
+          3. Optionally enforces a max_list_pages cap by short-circuiting
+             the second-and-later pages of an OTX list endpoint (heuristic
+             based on URL containing '/pulses/subscribed' or '/events').
+          4. Sleeps OTX_LIST_PAGE_DELAY_SECONDS between list pages.
 
-        Args:
-            max_list_pages: If > 0, stop walking after this many pages.
+        `OTX_REQUEST_DELAY_SECONDS` is applied inside `get_pulse_indicators`
+        (and any other method that wants to throttle a single request) via
+        the `_sleep_after_request()` helper.
         """
-        original = getattr(self.otx, "walkapi_iter", None)
-        if original is None:
-            logger.warning(
-                "OTXv2 SDK does not expose walkapi_iter — skipping list-page throttle install."
-            )
-            return
-
         sem = _get_otx_request_semaphore()
 
-        def throttled_walkapi_iter(url, params=None, headers=None, **kwargs):
-            """Generator that yields items from paginated OTX endpoints,
-            throttling each page request via the OTX semaphore + delay.
-            """
-            page_count = 0
-            current_url = url
-            current_params = params
-            current_headers = headers
-            while current_url is not None:
-                if max_list_pages > 0 and page_count >= max_list_pages:
-                    logger.info(
-                        f"Reached OTX_MAX_LIST_PAGES={max_list_pages}; stopping page walk."
-                    )
-                    break
-                with sem:
-                    try:
-                        page = original(
-                            current_url,
-                            params=current_params,
-                            headers=current_headers,
-                            **kwargs,
-                        )
-                        # The original returns a tuple (next_url, data)
-                        next_url, data = page
-                    except Exception as e:
-                        logger.error(
-                            f"Error during throttled OTX page fetch ({current_url}): {e}",
-                            exc_info=True,
-                        )
-                        raise
-                page_count += 1
-                _sleep_between_list_pages()
-                # OTXv2's walkapi_iter is itself a generator; we need to
-                # iterate the returned `data` (which may be a generator
-                # or list) and yield each item, then continue pagination.
-                if hasattr(data, "__iter__") and not isinstance(
-                    data, (dict, str, bytes)
-                ):
-                    for item in data:
-                        yield item
-                else:
-                    # Single object response
-                    yield data
-                current_url = next_url
-                current_params = None  # next_url is fully qualified
-                current_headers = None
+        # Keep a counter per SDK instance so max_list_pages is enforced
+        # across multiple paginated walks within the same run.
+        if not hasattr(self.otx, "_throttled_list_page_count"):
+            self.otx._throttled_list_page_count = 0
+        if not hasattr(self.otx, "_throttled_get_count"):
+            self.otx._throttled_get_count = 0
 
-        # Bind to the instance so it shadows the SDK method.
-        # Use setattr so we don't depend on subclass method-resolution quirks.
+        original_get = self.otx.get
+        original_post = self.otx.post
+
+        def _is_list_endpoint(url: str) -> bool:
+            """Heuristic: is this URL a paginated LIST endpoint?"""
+            if not isinstance(url, str):
+                return False
+            return ("/pulses/subscribed" in url) or ("/api/v1/events" in url)
+
+        def throttled_get(url, *args, **kwargs):
+            with sem:
+                if _is_list_endpoint(url):
+                    self.otx._throttled_list_page_count += 1
+                    if (
+                        max_list_pages > 0
+                        and self.otx._throttled_list_page_count > max_list_pages
+                    ):
+                        logger.info(
+                            f"OTX_MAX_LIST_PAGES={max_list_pages} reached; "
+                            f"refusing further list-page fetch: {url}"
+                        )
+                        # Return an empty page with no `next` so callers
+                        # stop paginating cleanly.
+                        return {"results": [], "next": None}
+                self.otx._throttled_get_count += 1
+                result = original_get(url, *args, **kwargs)
+            # Sleep AFTER releasing the semaphore so other workers can
+            # still make progress during the throttle window.
+            if _is_list_endpoint(url):
+                _sleep_between_list_pages()
+            return result
+
+        def throttled_post(url, *args, **kwargs):
+            with sem:
+                result = original_post(url, *args, **kwargs)
+            _sleep_after_request()
+            return result
+
         try:
-            self.otx.walkapi_iter = throttled_walkapi_iter
+            # Bind onto the SDK instance using normal attribute assignment.
+            # `OTXv2.get` is defined on the class; assigning on the
+            # instance creates an instance attribute that shadows it.
+            self.otx.get = throttled_get
+            self.otx.post = throttled_post
             logger.info(
-                f"Installed throttled walkapi_iter on OTX client "
+                "Installed throttled get()/post() on OTX client "
                 f"(max_list_pages={max_list_pages})."
             )
         except Exception as e:
             logger.error(
-                f"Failed to install walkapi_iter throttle: {e}",
+                f"Failed to install OTX request throttle: {e}",
                 exc_info=True,
             )
 
