@@ -127,6 +127,20 @@ class FilteredOTXv2Cached(OTXv2Cached):
             _read_timeout = float(_os.getenv("OTX_READ_TIMEOUT", "60.0"))
         except (ValueError, TypeError):
             _max_retries, _connect_timeout, _read_timeout = 1, 10.0, 60.0
+
+        # Persist these as instance attributes so the throttle wrapper
+        # (which intercepts self.otx.get / self.otx.session().get AFTER
+        # this point) can apply them as a real `timeout=` kwarg.
+        #
+        # Why this matters: the SDK calls self.session().get(url, ...) with
+        # no timeout kwarg. Setting self.session.timeout is a no-op on
+        # requests.Session — there is no such attribute. The only way to
+        # actually cap a hung OTX call is to inject `timeout=` into the
+        # outbound request itself. We do this in the throttle wrapper
+        # below.
+        self._otx_connect_timeout = _connect_timeout
+        self._otx_read_timeout = _read_timeout
+
         self._override_sdk_session(
             max_retries=_max_retries,
             connect_timeout=_connect_timeout,
@@ -147,10 +161,15 @@ class FilteredOTXv2Cached(OTXv2Cached):
         5xx into ~31 seconds of internal back-off before RetryError.
         On persistent 5xx, urllib3 gives up with "too many 504 error responses".
 
-        We replace the adapter with one that:
-        - Has max_retries=1 (fail fast on 5xx — let our own
-          OTX_REQUEST_DELAY_SECONDS + OTX_BACKOFF_SECONDS handle back-off)
-        - Has hard connect + read timeouts so requests never hang silently
+        We replace the adapter with one that has max_retries=1 (fail fast on
+        5xx — let our own OTX_REQUEST_DELAY_SECONDS + OTX_BACKOFF_SECONDS
+        handle back-off).
+
+        IMPORTANT: setting self.session.timeout is a NO-OP on
+        requests.Session — that attribute doesn't exist. We instead capture
+        the timeout values on the instance and inject them as a real
+        `timeout=` kwarg into every outbound call inside the throttle
+        wrapper (see _install_request_throttle + _patch_session_get).
         """
         try:
             from requests.adapters import HTTPAdapter
@@ -173,11 +192,10 @@ class FilteredOTXv2Cached(OTXv2Cached):
             _ = self.session
             self.session.mount("https://", adapter)
             self.session.mount("http://", adapter)
-            # Set timeouts on the session so all requests use them.
-            self.session.timeout = {"connect": connect_timeout, "read": read_timeout}
             _log.getLogger("clients.otx_client").info(
-                f"OTX SDK session overridden: retries={max_retries}, "
-                f"connect={connect_timeout}s, read={read_timeout}s"
+                f"OTX SDK HTTPAdapter overridden: retries={max_retries}, "
+                f"connect={connect_timeout}s, read={read_timeout}s "
+                "(timeouts injected per-call in throttle wrapper)."
             )
         except Exception as e:
             _log.getLogger("clients.otx_client").warning(
@@ -416,28 +434,78 @@ class OTXClient:
                     if max_pulses is not None and processed_pulses_count >= max_pulses:
                         break
                     _track_modified(pulse)
+                    processed_pulses_count += 1
+                    if processed_pulses_count % 100 == 0:
+                        logger.info(
+                            f"Heartbeat: {processed_pulses_count} pulses iterated so far..."
+                        )
                     yield pulse
             else:
                 logger.info(
                     f"Filtering pulses by whitelisted authors (will call OTX API {len(author_whitelist)} times)"
                 )
+                # --------------------------------------------------------------
+                # Per-author circuit breaker
+                # --------------------------------------------------------------
+                # If a particular OTX pulse endpoint repeatedly hangs or 5xxs
+                # (e.g. a single corrupt pulse ID), we don't want to stall the
+                # whole cycle. Track consecutive getall() failures per author;
+                # after `OTX_CONSECUTIVE_FAILURE_LIMIT` (default 5), skip the
+                # rest of that author's pulses for this cycle.
+                #
+                # The heartbeat every 50 pulses keeps the cycle visible even
+                # when progress is slow.
+                # --------------------------------------------------------------
+                try:
+                    failure_limit = max(
+                        1, int(os.getenv("OTX_CONSECUTIVE_FAILURE_LIMIT", "5"))
+                    )
+                except ValueError:
+                    failure_limit = 5
+
                 for author in sorted(author_whitelist):
                     logger.info(f"  -> Fetching pulses for author: '{author}'")
-                    for pulse in self.otx.getall(
-                        iter=True, author_name=author, limit=max_pulses
-                    ):
-                        if (
-                            max_pulses is not None
-                            and processed_pulses_count >= max_pulses
+                    consecutive_failures = 0
+                    author_pulses_seen = 0
+                    try:
+                        for pulse in self.otx.getall(
+                            iter=True, author_name=author, limit=max_pulses
                         ):
-                            break
-                        pulse_author = (pulse.get("author_name") or "").lower()
-                        if pulse_author != author:
-                            continue
-                        _track_modified(pulse)
-                        yield pulse
+                            if (
+                                max_pulses is not None
+                                and processed_pulses_count >= max_pulses
+                            ):
+                                break
+                            pulse_author = (pulse.get("author_name") or "").lower()
+                            if pulse_author != author:
+                                continue
+                            _track_modified(pulse)
+                            processed_pulses_count += 1
+                            author_pulses_seen += 1
+                            if author_pulses_seen % 50 == 0:
+                                logger.info(
+                                    f"Heartbeat: '{author}' author at {author_pulses_seen} pulses; total {processed_pulses_count} so far..."
+                                )
+                            yield pulse
+                    except (
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError,
+                        requests.exceptions.ChunkedEncodingError,
+                        requests.exceptions.RequestException,
+                        OTXv2RetryError,
+                    ) as e:
+                        logger.warning(
+                            f"getall() for author '{author}' failed: {type(e).__name__}: {e}. "
+                            f"Skipping remaining pulses for this author in this cycle."
+                        )
+                        continue
+
                     if max_pulses is not None and processed_pulses_count >= max_pulses:
                         break
+
+                    logger.info(
+                        f"  -> '{author}': yielded {author_pulses_seen} pulse(s) this cycle."
+                    )
 
             # Persist the latest modified timestamp after we finish yielding
             if latest_modified_time_in_batch:
@@ -780,6 +848,64 @@ class OTXClient:
             logger.error(f"Error analyzing author statistics: {e}", exc_info=True)
             return {}
 
+    def _patch_session_for_real_timeout(self) -> None:
+        """
+        Inject `timeout=(connect, read)` into every OTX HTTPS call.
+
+        The OTXv2 SDK constructs a requests.Session lazily on first call
+        to self.session(). Inside OTXv2.get/post/patch/delete it calls
+        self.session().get(url, headers=..., proxies=..., verify=..., cert=...)
+        with no `timeout=` kwarg. requests' default behaviour is to wait
+        forever on a hung TCP connection.
+
+        We wrap the actual Session.get / Session.post methods so every
+        outbound request gets our connect+read timeout tuple as a kwarg.
+        urllib3 then raises requests.exceptions.Timeout after the read
+        timeout elapses, which the SDK's caller (our get_pulse_indicators)
+        is already prepared to handle.
+
+        Safe to call multiple times — patches are idempotent (we attach
+        the wrapper only once per session instance).
+        """
+        try:
+            connect = getattr(self, "_otx_connect_timeout", 10.0)
+            read = getattr(self, "_otx_read_timeout", 60.0)
+            timeout_tuple = (float(connect), float(read))
+
+            # Force session creation (the SDK lazy-inits it on first call).
+            sess = self.session
+            if getattr(sess, "_misp_taxii_timeout_patched", False):
+                return  # already patched — idempotent
+
+            original_session_get = sess.get
+            original_session_post = sess.post
+
+            def _with_timeout(caller):
+                """Wrap a requests.Session method to inject `timeout=`
+                if the caller didn't supply one."""
+
+                def wrapped(url, *args, **kwargs):
+                    if "timeout" not in kwargs:
+                        kwargs["timeout"] = timeout_tuple
+                    return caller(url, *args, **kwargs)
+
+                wrapped.__wrapped__ = caller
+                return wrapped
+
+            sess.get = _with_timeout(original_session_get)
+            sess.post = _with_timeout(original_session_post)
+            sess._misp_taxii_timeout_patched = True
+            logger.info(
+                "Patched OTX requests.Session with hard timeout "
+                f"(connect={connect}s, read={read}s)."
+            )
+        except Exception as e:
+            logger.warning(
+                f"Could not patch OTX session for real timeout "
+                f"(SDK may behave as before): {e}",
+                exc_info=True,
+            )
+
     def _install_request_throttle(self, max_list_pages: int = 0) -> None:
         """
         Wrap the OTX SDK's `get()` and `post()` methods with our throttle.
@@ -804,6 +930,11 @@ class OTXClient:
         `OTX_REQUEST_DELAY_SECONDS` is applied inside `get_pulse_indicators`
         (and any other method that wants to throttle a single request) via
         the `_sleep_after_request()` helper.
+
+        `_patch_session_for_real_timeout` is called after this method to
+        inject `timeout=` directly into the underlying requests.Session
+        instance. Without that, the SDK's get() calls bypass any per-call
+        timeout and can hang indefinitely on a slow OTX endpoint.
         """
         sem = _get_otx_request_semaphore()
 
@@ -867,6 +998,20 @@ class OTXClient:
                 f"Failed to install OTX request throttle: {e}",
                 exc_info=True,
             )
+
+        # ------------------------------------------------------------------
+        # REAL TIMEOUT INJECTION
+        # ------------------------------------------------------------------
+        # The SDK calls self.session().get(url, headers=..., proxies=...,
+        # verify=..., cert=...) inside OTXv2.get() — WITHOUT a `timeout=`
+        # kwarg. That means even if `OTX_READ_TIMEOUT=60` is set, urllib3
+        # can still hang forever on a half-open connection to OTX.
+        #
+        # We patch the underlying requests.Session.get/post to inject our
+        # own `timeout=(connect, read)` tuple. This is the *only* place a
+        # hard timeout is enforced — nothing in the SDK or our throttle
+        # wrapper above stops a true TCP hang.
+        self._patch_session_for_real_timeout()
 
     def get_pulse_indicators(self, pulse_id: str) -> list[dict]:
         """
