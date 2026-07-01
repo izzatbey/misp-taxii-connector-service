@@ -189,9 +189,12 @@ class FilteredOTXv2Cached(OTXv2Cached):
                 pool_maxsize=4,
             )
             # Force the session to exist first so we can mount our adapter.
-            _ = self.session
-            self.session.mount("https://", adapter)
-            self.session.mount("http://", adapter)
+            # NOTE: `self.session()` is a method — we MUST call it with parens
+            # to get the underlying requests.Session instance. Without parens
+            # we'd have a bound method object, which has no `.mount`.
+            _sess = self.session()
+            _sess.mount("https://", adapter)
+            _sess.mount("http://", adapter)
             _log.getLogger("clients.otx_client").info(
                 f"OTX SDK HTTPAdapter overridden: retries={max_retries}, "
                 f"connect={connect_timeout}s, read={read_timeout}s "
@@ -853,7 +856,11 @@ class OTXClient:
         Inject `timeout=(connect, read)` into every OTX HTTPS call.
 
         The OTXv2 SDK constructs a requests.Session lazily on first call
-        to self.session(). Inside OTXv2.get/post/patch/delete it calls
+        to self.session() — but `self.session` here refers to the
+        UNDERLYING OTXv2 instance, not this OTXClient wrapper. We
+        therefore reach through self.otx.session.
+
+        Inside OTXv2.get/post/patch/delete it calls
         self.session().get(url, headers=..., proxies=..., verify=..., cert=...)
         with no `timeout=` kwarg. requests' default behaviour is to wait
         forever on a hung TCP connection.
@@ -872,9 +879,19 @@ class OTXClient:
             read = getattr(self, "_otx_read_timeout", 60.0)
             timeout_tuple = (float(connect), float(read))
 
-            # Force session creation (the SDK lazy-inits it on first call).
-            sess = self.session
+            # Reach the actual SDK session — self.otx is the
+            # FilteredOTXv2Cached (subclass of OTXv2 which is
+            # subclass of OTXv2Cached). self.otx.session() is the
+            # lazy-init method that returns the requests.Session.
+            otx_sdk = getattr(self, "otx", None)
+            if otx_sdk is None:
+                raise AttributeError("self.otx is not set — OTXClient not initialized?")
+
+            sess = otx_sdk.session()  # <-- force lazy session creation
             if getattr(sess, "_misp_taxii_timeout_patched", False):
+                logger.info(
+                    "OTX requests.Session already patched for timeouts; skipping."
+                )
                 return  # already patched — idempotent
 
             original_session_get = sess.get
@@ -896,7 +913,7 @@ class OTXClient:
             sess.post = _with_timeout(original_session_post)
             sess._misp_taxii_timeout_patched = True
             logger.info(
-                "Patched OTX requests.Session with hard timeout "
+                f"Patched OTX requests.Session with hard timeout "
                 f"(connect={connect}s, read={read}s)."
             )
         except Exception as e:
