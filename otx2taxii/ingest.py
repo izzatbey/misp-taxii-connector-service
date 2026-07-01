@@ -254,7 +254,7 @@ def run_one_ingest_cycle(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OTX → outbox ingestion")
+    parser = argparse.ArgumentParser(description="OTX to outbox ingestion")
     parser.add_argument(
         "--loop",
         action="store_true",
@@ -265,7 +265,37 @@ def main():
         action="store_true",
         help="Run a single cycle and exit (default).",
     )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help=(
+            "Wipe <STIX_OUTBOX_DIR>/pending and <STIX_OUTBOX_DIR>/processed, then exit. "
+            "Use this if the outbox has gotten into a bad state (corrupt chunks piling up, "
+            "or after a major TAXII endpoint migration where you want to re-push from scratch)."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.reset:
+        # Need a minimal config to know where the outbox is. Don't init OTX.
+        load_dotenv()
+        config = Config()
+        pending_dir, processed_dir = _ensure_outbox_dirs(config.STIX_OUTBOX_DIR)
+
+        for label, d in [("pending", pending_dir), ("processed", processed_dir)]:
+            if os.path.isdir(d):
+                count = 0
+                for fname in os.listdir(d):
+                    fpath = os.path.join(d, fname)
+                    if os.path.isfile(fpath) and not fname.endswith(".tmp"):
+                        try:
+                            os.remove(fpath)
+                            count += 1
+                        except OSError as e:
+                            logging.warning(f"Could not delete {fpath}: {e}")
+                logging.info(f"[ingest] --reset: deleted {count} file(s) from {d}")
+        logging.info("[ingest] --reset: outbox wiped. Exiting.")
+        sys.exit(0)
 
     load_dotenv()
     config = Config()

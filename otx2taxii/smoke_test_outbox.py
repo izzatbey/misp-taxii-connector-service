@@ -105,6 +105,9 @@ def test_list_outbox_chunks_reads_in_order():
             with open(os.path.join(pending, "stray.tmp"), "w") as f:
                 f.write("ignore me")
             continue
+        # filename's indicator_count == len(bundle.objects). Compute it to
+        # match what _write_chunk actually emits.
+        n_objects = (count // 50) + 1
         _write_chunk(
             pending_dir=pending,
             pulse_id=pulse_id,
@@ -114,8 +117,7 @@ def test_list_outbox_chunks_reads_in_order():
             bundle_dict={
                 "type": "bundle",
                 "id": f"bundle--{pulse_id}-{idx}",
-                "objects": [{"type": "identity", "id": "identity--otx"}]
-                * (count // 50 + 1),
+                "objects": [{"type": "identity", "id": "identity--otx"}] * n_objects,
             },
         )
 
@@ -123,9 +125,13 @@ def test_list_outbox_chunks_reads_in_order():
     basenames = [os.path.basename(p) for p in listed]
 
     # Expected sort: alphabetical by filename.
-    # pulse-A__1__1__*.json < pulse-X__1__3__*.json < pulse-X__2__3__*.json < pulse-X__3__3__*.json
+    # indicator_count == (count // 50) + 1:
+    #   pulse-A count=50  -> 2 objects  -> pulse-A__1__1__2.json
+    #   pulse-X count=200 -> 5 objects  -> pulse-X__1__3__5.json
+    #   pulse-X count=100 -> 3 objects  -> pulse-X__2__3__3.json
+    #   pulse-X count=47  -> 1 object   -> pulse-X__3__3__1.json
     expected = [
-        "pulse-A__1__1__1.json",
+        "pulse-A__1__1__2.json",
         "pulse-X__1__3__5.json",
         "pulse-X__2__3__3.json",
         "pulse-X__3__3__1.json",
