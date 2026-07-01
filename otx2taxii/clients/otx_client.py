@@ -114,6 +114,76 @@ class FilteredOTXv2Cached(OTXv2Cached):
         )
         super().__init__(api_key, cache_dir=cache_dir, max_age=max_age, *args, **kwargs)
 
+        # Override the OTXv2 SDK's urllib3 retry policy so one slow OTX 5xx
+        # doesn't amplify into ~31 seconds of internal back-off.
+        # OTXv2 mounts an HTTPAdapter with total=5 retries on 429/500/502/503/504.
+        # We reduce to 1 retry + set explicit timeouts. The existing
+        # OTX_REQUEST_DELAY_SECONDS / OTX_BACKOFF_SECONDS in main.py handle back-off.
+        try:
+            import os as _os
+
+            _max_retries = max(1, int(_os.getenv("OTX_MAX_SDK_RETRIES", "1")))
+            _connect_timeout = float(_os.getenv("OTX_CONNECT_TIMEOUT", "10.0"))
+            _read_timeout = float(_os.getenv("OTX_READ_TIMEOUT", "60.0"))
+        except (ValueError, TypeError):
+            _max_retries, _connect_timeout, _read_timeout = 1, 10.0, 60.0
+        self._override_sdk_session(
+            max_retries=_max_retries,
+            connect_timeout=_connect_timeout,
+            read_timeout=_read_timeout,
+        )
+
+    def _override_sdk_session(
+        self,
+        max_retries: int = 1,
+        connect_timeout: float = 10.0,
+        read_timeout: float = 60.0,
+    ) -> None:
+        """
+        Override the OTXv2 SDK's urllib3 HTTPAdapter retry + timeout policy.
+
+        OTXv2 by default mounts an HTTPAdapter with total=5 retries on
+        429/500/502/503/504 + backoff_factor=1, which can amplify one slow OTX
+        5xx into ~31 seconds of internal back-off before RetryError.
+        On persistent 5xx, urllib3 gives up with "too many 504 error responses".
+
+        We replace the adapter with one that:
+        - Has max_retries=1 (fail fast on 5xx — let our own
+          OTX_REQUEST_DELAY_SECONDS + OTX_BACKOFF_SECONDS handle back-off)
+        - Has hard connect + read timeouts so requests never hang silently
+        """
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            import logging as _log
+
+            retry_cfg = Retry(
+                total=max_retries,
+                connect=0,
+                read=0,
+                status_forcelist=[],
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(
+                max_retries=retry_cfg,
+                pool_connections=4,
+                pool_maxsize=4,
+            )
+            # Force the session to exist first so we can mount our adapter.
+            _ = self.session
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
+            # Set timeouts on the session so all requests use them.
+            self.session.timeout = {"connect": connect_timeout, "read": read_timeout}
+            _log.getLogger("clients.otx_client").info(
+                f"OTX SDK session overridden: retries={max_retries}, "
+                f"connect={connect_timeout}s, read={read_timeout}s"
+            )
+        except Exception as e:
+            _log.getLogger("clients.otx_client").warning(
+                f"Could not override OTX SDK session (may already be cached): {e}"
+            )
+
     def save_pulse(self, p):
         """Override to skip writing pulses from non-whitelisted authors."""
         if self._allowed_authors is not None:

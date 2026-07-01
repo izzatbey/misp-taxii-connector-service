@@ -104,6 +104,17 @@ class Config:
             os.getenv("MAX_INDICATORS_PER_PULSE", "200")
         )
 
+        # OTX SDK retry / timeout overrides.
+        # OTXv2 mounts an HTTPAdapter with total=5 retries on
+        # 429/500/502/503/504 + backoff_factor=1, which amplifies one
+        # slow/hung OTX call into ~31 seconds of internal back-off before
+        # RetryError. On persistent 5xx it gives "too many 504 error responses".
+        # Override here to fail fast on OTX 5xx so our own
+        # OTX_REQUEST_DELAY_SECONDS back-off handles the rate-limit instead.
+        self.OTX_MAX_SDK_RETRIES = max(1, int(os.getenv("OTX_MAX_SDK_RETRIES", "1")))
+        self.OTX_CONNECT_TIMEOUT = float(os.getenv("OTX_CONNECT_TIMEOUT", "10.0"))
+        self.OTX_READ_TIMEOUT = float(os.getenv("OTX_READ_TIMEOUT", "60.0"))
+
         # ------------------------------------------------------------------
         # Outbox / two-process architecture knobs.
         #
