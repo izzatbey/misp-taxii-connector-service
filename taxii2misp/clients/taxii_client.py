@@ -135,15 +135,37 @@ class TAXIIClient:
             all_objects = []
             fetch_error = None
             try:
-                response = self.collection.get_objects(limit=batch_size)
-                if hasattr(response, "as_pages"):
-                    for page in response.as_pages():
-                        page_envelope = page.get("envelope", page)
-                        all_objects.extend(page_envelope.get("objects", []))
-                elif isinstance(response, dict):
-                    all_objects = response.get("objects", [])
-                else:
-                    all_objects = response
+                # ------------------------------------------------------------------
+                # CORRECT pagination: use the module-level taxii21.as_pages()
+                # helper, which loops over envelopes and follows the server's
+                # `next` cursor until `more: false`.
+                #
+                # The previous implementation did `response.as_pages()` on the
+                # dict returned by get_objects(), which never worked — dicts
+                # don't have an as_pages attribute — so the code silently
+                # fell through to single-page mode, fetching only the first
+                # `batch_size` (10k) objects regardless of how big the
+                # collection was.
+                #
+                # taxii21.as_pages(collection.get_objects, per_request=N)
+                # yields successive envelopes, each containing
+                # {"objects": [...], "more": bool, "next": str}.
+                # ------------------------------------------------------------------
+                logger.info(
+                    f"Fetching full collection stream using taxii21.as_pages "
+                    f"(per_request={batch_size})"
+                )
+                for envelope in taxii21.as_pages(
+                    self.collection.get_objects, per_request=batch_size
+                ):
+                    page_objects = envelope.get("objects", [])
+                    all_objects.extend(page_objects)
+                    logger.info(
+                        f"  Page received: +{len(page_objects)} objects "
+                        f"(total {len(all_objects)}, more={envelope.get('more', False)})"
+                    )
+                    if not envelope.get("more", False):
+                        break
             except Exception as e:
                 fetch_error = e
                 logger.warning(f"Full-collection fetch failed: {e}")
@@ -301,7 +323,11 @@ class TAXIIClient:
                 f"Fetching pages {start_page} to {end_page} for offset {offset}"
             )
 
-            pages = self.collection.get_objects(limit=page_size).as_pages()
+            # CORRECT pagination: taxii21.as_pages returns envelopes that
+            # follow the server's `next` cursor. The previous code
+            # `get_objects(...).as_pages()` was broken — get_objects()
+            # returns a dict, not a thing with as_pages().
+            pages = taxii21.as_pages(self.collection.get_objects, per_request=page_size)
 
             all_objects = []
             current_page = 0
@@ -449,11 +475,16 @@ class TAXIIClient:
             objects = []
             retrieved_count = 0
 
-            # Use as_pages for efficient pagination
+            # Use taxii21.as_pages for efficient pagination (correct API).
+            # The previous `get_objects().as_pages()` pattern was broken
+            # because get_objects returns a dict that has no as_pages method.
             try:
-                envelope_pages = self.collection.get_objects(
-                    limit=self.chunk_size, **filter_params
-                ).as_pages()
+                envelope_pages = taxii21.as_pages(
+                    lambda **kw: self.collection.get_objects(
+                        limit=self.chunk_size, **filter_params, **kw
+                    ),
+                    per_request=self.chunk_size,
+                )
 
                 for page_envelope in envelope_pages:
                     if max_objects and retrieved_count >= max_objects:
@@ -1047,9 +1078,14 @@ class TAXIIClient:
             )  # Double the chunk size but cap at 200
 
             try:
-                envelope_pages = self.collection.get_objects(
-                    limit=chunk_size, **filter_params
-                ).as_pages()
+                # CORRECT pagination: use taxii21.as_pages, not
+                # `get_objects().as_pages()` (which never worked).
+                envelope_pages = taxii21.as_pages(
+                    lambda **kw: self.collection.get_objects(
+                        limit=chunk_size, **filter_params, **kw
+                    ),
+                    per_request=chunk_size,
+                )
 
                 for page_num, page_envelope in enumerate(envelope_pages):
                     if max_objects and retrieved_count >= max_objects:
