@@ -227,9 +227,26 @@ class FilteredOTXv2Cached(OTXv2Cached):
             )
 
     def save_pulse(self, p):
-        """Override to skip writing pulses from non-whitelisted authors."""
+        """Override to skip writing pulses from non-whitelisted authors.
+
+        Returns:
+            None if pulse was filtered out (either author not in whitelist
+            OR pulse has no author_name field).
+            Whatever super().save_pulse(p) returns otherwise (the SDK logs
+            "Saving pulse ..." and writes the JSON file).
+        """
         if self._allowed_authors is not None:
             author = (p.get("author_name") or "").lower()
+            if not author:
+                # OTX occasionally returns pulses with no author_name
+                # field (e.g. malformed pulse or API edge case). Without
+                # this warning we silently drop these and never know why
+                # a particular pulse ID is missing from the cache.
+                logger.warning(
+                    f"save_pulse: pulse {p.get('id', '?')} has no "
+                    f"author_name; skipping (cannot whitelist-match)."
+                )
+                return None
             if author not in self._allowed_authors:
                 # Silently skip — do not log per-pulse (would spam the log on
                 # large subscription lists)
