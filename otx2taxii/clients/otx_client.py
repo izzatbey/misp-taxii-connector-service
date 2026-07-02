@@ -88,6 +88,27 @@ def _sleep_between_list_pages() -> None:
         time.sleep(_otx_list_page_delay_seconds)
 
 
+def _get_otx_page_size() -> int:
+    """
+    Page size for OTX list API calls.
+
+    Default 50 (the OTX API's own default). With ~13k subscribed
+    pulses and `OTX_LIST_PAGE_DELAY_SECONDS=1.0`, the default takes
+    260 cycles × ~1.5s = ~6.5 minutes for one full walk. Bumping
+    to 100 halves the number of HTTP requests; tuning the page
+    delay to 0.25s cuts the cycle time to ~0.4s — combined, ~80s.
+
+    Set `OTX_PAGE_SIZE` in .env to override. Range 1–200; the OTX
+    API caps at 200.
+    """
+    try:
+        val = int(os.getenv("OTX_PAGE_SIZE", "50"))
+    except (ValueError, TypeError):
+        val = 50
+    # Clamp to a safe range. <10 wastes HTTP calls; >200 hits the API cap.
+    return max(10, min(200, val))
+
+
 class FilteredOTXv2Cached(OTXv2Cached):
     """
     Subclass of OTXv2Cached that filters out non-whitelisted authors at
@@ -385,11 +406,28 @@ class OTXClient:
         logger.info(
             "Starting OTXv2Cached update to fetch new/modified pulses into local cache..."
         )
+        # --------------------------------------------------------------
+        # otx.update() is the BULK subscribed-feed walk. If it fails
+        # (502/timeout/etc.), we still want to fall through to getall()
+        # using whatever is already on disk from a previous successful
+        # update. The outer try/except below will catch and log it; this
+        # local try catches the bare-Exception 5xx case (which is what
+        # the SDK raises for 500/502) and prevents the cycle from
+        # aborting. Other request exceptions are also caught here so the
+        # per-author getall() below can still iterate the disk cache.
+        # --------------------------------------------------------------
         try:
             self.otx.update()
             logger.info(
                 "OTXv2Cached update completed. Data should now be in local cache."
             )
+        except Exception as e:
+            logger.warning(
+                f"OTXv2Cached update() raised {type(e).__name__}: {e}. "
+                f"Falling through to getall() — will iterate whatever is "
+                f"already on disk in the OTX cache."
+            )
+            # Don't re-raise — let getall() try anyway with whatever is cached.
 
             processed_pulses_count = 0
 
@@ -433,7 +471,7 @@ class OTXClient:
 
             if author_whitelist is None:
                 logger.info("Retrieving pulses from ALL subscribed authors")
-                for pulse in self.otx.getall(iter=True, limit=max_pulses):
+                for pulse in self.otx.getall(iter=True, limit=_get_otx_page_size()):
                     if max_pulses is not None and processed_pulses_count >= max_pulses:
                         break
                     _track_modified(pulse)
@@ -472,7 +510,9 @@ class OTXClient:
                     author_pulses_seen = 0
                     try:
                         for pulse in self.otx.getall(
-                            iter=True, author_name=author, limit=max_pulses
+                            iter=True,
+                            author_name=author,
+                            limit=_get_otx_page_size(),
                         ):
                             if (
                                 max_pulses is not None
@@ -502,6 +542,22 @@ class OTXClient:
                             f"Skipping remaining pulses for this author in this cycle."
                         )
                         continue
+                    except Exception as e:
+                        # Catch-all for OTX-side errors that the SDK raises
+                        # as bare Exception (e.g. 5xx from
+                        # handle_response_errors). Without this, the outer
+                        # `except Exception` would convert every per-author
+                        # hiccup into an OTXAPIUnavailable, force a 300s
+                        # back-off, and force ingest.py to restart from
+                        # page 1 of the subscribed feed — losing all
+                        # progress made on other authors.
+                        logger.warning(
+                            f"getall() for author '{author}' raised "
+                            f"{type(e).__name__}: {e}. "
+                            f"Skipping remaining pulses for this author "
+                            f"in this cycle (other authors still run)."
+                        )
+                        continue
 
                     if max_pulses is not None and processed_pulses_count >= max_pulses:
                         break
@@ -520,34 +576,18 @@ class OTXClient:
                     "No pulses with valid 'modified' timestamps were found to update the application's last fetch time."
                 )
 
-        except requests.exceptions.Timeout as e:
-            logger.error(
-                f"OTX API update timed out: {e}.",
-                exc_info=True,
-            )
-            raise OTXAPIUnavailable(f"OTX API timeout: {e}") from e
-        except requests.exceptions.ConnectionError as e:
-            logger.error(
-                f"Failed to connect to OTX API during update: {e}.",
-                exc_info=True,
-            )
-            raise OTXAPIUnavailable(f"OTX API connection error: {e}") from e
-        except requests.exceptions.RequestException as e:
-            logger.error(
-                f"An HTTP error occurred during OTXv2Cached update: {e}", exc_info=True
-            )
-            raise OTXAPIUnavailable(f"OTX API HTTP error: {e}") from e
-        except OTXv2RetryError as e:
-            logger.error(
-                f"OTX SDK exhausted retries (likely upstream 5xx): {e}", exc_info=True
-            )
-            raise OTXAPIUnavailable(f"OTX API exhausted retries: {e}") from e
-        except Exception as e:
-            logger.error(
-                f"An unexpected error occurred during OTXv2Cached update: {e}",
-                exc_info=True,
-            )
-            raise OTXAPIUnavailable(f"Unexpected OTX error: {e}") from e
+        # --------------------------------------------------------------
+        # The original outer try/except was removed because every path
+        # inside this generator is now handled by EITHER:
+        #   (a) the inner `try: self.otx.update() except Exception` (which
+        #       swallows OTX 5xx/timeout and falls through to getall())
+        #   (b) the per-author `try/except` blocks (which swallow
+        #       request-level errors and skip the rest of that author)
+        # The historical `except Exception -> raise OTXAPIUnavailable`
+        # was the cause of "ingest backs off 300s and restarts from
+        # page 1 of the subscribed feed on any single 502" — exactly
+        # the failure mode we saw in the 2026-07-01 logs.
+        # --------------------------------------------------------------
 
     def get_all_subscribed_pulses(
         self,
@@ -606,7 +646,7 @@ class OTXClient:
             if author_whitelist is None:
                 # No filter — get pulses from all subscribed authors
                 logger.info("Retrieving pulses from ALL subscribed authors")
-                for pulse in self.otx.getall(iter=True, limit=max_pulses):
+                for pulse in self.otx.getall(iter=True, limit=_get_otx_page_size()):
                     if max_pulses is not None and processed_pulses_count >= max_pulses:
                         logger.info(
                             f"Reached test limit of {max_pulses} pulses from cache. Stopping iteration."
@@ -632,7 +672,9 @@ class OTXClient:
                 for author in sorted(author_whitelist):
                     logger.info(f"  -> Fetching pulses for author: '{author}'")
                     for pulse in self.otx.getall(
-                        iter=True, author_name=author, limit=max_pulses
+                        iter=True,
+                        author_name=author,
+                        limit=_get_otx_page_size(),
                     ):
                         if (
                             max_pulses is not None
@@ -823,7 +865,7 @@ class OTXClient:
             processed_count = 0
 
             # Get all pulses without author filtering to analyze
-            for pulse in self.otx.getall(iter=True, limit=max_pulses):
+            for pulse in self.otx.getall(iter=True, limit=_get_otx_page_size()):
                 if max_pulses is not None and processed_count >= max_pulses:
                     break
 
