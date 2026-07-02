@@ -118,7 +118,62 @@ class TAXIIClient:
             batch_count = 0
             total_processed = last_processed_offset
 
-            while True:
+            # --------------------------------------------------------------
+            # Fetch the entire collection up front (one big stream), then
+            # slice it into batches. The previous implementation called
+            # `get_objects(limit=batch_size)` once per batch and tried to
+            # skip ahead via offset, but the TAXII 2.1 client library
+            # doesn't honour offset — every call returns the first
+            # `limit` objects, so batch 2+ were always empty for a
+            # collection with >batch_size objects.
+            # --------------------------------------------------------------
+            logger.info(
+                f"Fetching full collection stream (limit={batch_size} per "
+                f"HTTP call, will accumulate all pages)"
+            )
+
+            all_objects = []
+            fetch_error = None
+            try:
+                response = self.collection.get_objects(limit=batch_size)
+                if hasattr(response, "as_pages"):
+                    for page in response.as_pages():
+                        page_envelope = page.get("envelope", page)
+                        all_objects.extend(page_envelope.get("objects", []))
+                elif isinstance(response, dict):
+                    all_objects = response.get("objects", [])
+                else:
+                    all_objects = response
+            except Exception as e:
+                fetch_error = e
+                logger.warning(f"Full-collection fetch failed: {e}")
+                all_objects = []
+
+            logger.info(
+                f"Fetched {len(all_objects)} total objects from TAXII collection"
+            )
+
+            # Now slice into batches
+            total = len(all_objects)
+            if total == 0:
+                logger.info("✅ No more objects to process - completed")
+                if redis_client and redis_client.is_connected():
+                    try:
+                        redis_client.set_cached_data(
+                            cache_key,
+                            {
+                                "last_offset": 0,
+                                "batch_count": 0,
+                                "total_processed": 0,
+                                "last_run_time": "",
+                            },
+                            ttl_seconds=86400,
+                        )
+                    except Exception:
+                        pass
+                return
+
+            while current_offset < total:
                 if is_shutdown_requested():
                     logger.info("Shutdown requested during batch processing")
                     break
@@ -128,163 +183,76 @@ class TAXIIClient:
                     f"📦 Processing batch {batch_count + 1} (offset: {current_offset}, size: {batch_size})"
                 )
 
-                try:
-                    # Use TAXII's built-in pagination instead of manual offset handling
-                    batch_objects = []
+                batch_objects = all_objects[
+                    current_offset : current_offset + batch_size
+                ]
 
-                    # Get objects using proper TAXII pagination with fallback methods
+                if not batch_objects:
+                    logger.info("✅ No more objects to process - completed")
+                    break
+
+                batch_time = time.time() - batch_start_time
+                total_processed += len(batch_objects)
+
+                # Log batch statistics
+                logger.info(f"📊 Batch {batch_count + 1} completed:")
+                logger.info(f"   Objects in batch: {len(batch_objects)}")
+                logger.info(f"   Processing time: {batch_time:.2f}s")
+                logger.info(f"   Total processed: {total_processed}")
+                logger.info(
+                    f"   Rate: {len(batch_objects) / batch_time:.1f} objects/sec"
+                )
+
+                # Log object type distribution for this batch
+                batch_types = {}
+                for obj in batch_objects:
+                    obj_type = (
+                        obj.get("type", "unknown")
+                        if isinstance(obj, dict)
+                        else getattr(obj, "type", "unknown")
+                    )
+                    batch_types[obj_type] = batch_types.get(obj_type, 0) + 1
+                logger.info(f"   Types: {dict(sorted(batch_types.items()))}")
+
+                # Cache progress after each batch
+                if redis_client and redis_client.is_connected():
                     try:
-                        # Method 1: Try as_pages() for proper pagination
-                        response = self.collection.get_objects(limit=batch_size)
-
-                        if hasattr(response, "as_pages"):
-                            # TAXII 2.1 pagination support.
-                            #
-                            # The previous implementation iterated pages and `break` after
-                            # the first matching page, which only ever read the first
-                            # 10,000 objects (or whatever `limit=batch_size` was) and
-                            # never advanced. For a collection with 99,711+ objects,
-                            # this left ~90% of the data — including thousands of
-                            # groupings — permanently unseen.
-                            #
-                            # Correct behaviour:
-                            #   1. Walk pages in order, collecting objects across
-                            #      pages until we have at least batch_size objects
-                            #      AND have advanced past current_offset.
-                            #   2. Stop when the server returns `more: false`.
-                            pages = response.as_pages()
-                            collected = []
-                            more_pages = True
-                            seen_count = 0
-
-                            for page in pages:
-                                page_envelope = page.get("envelope", page)
-                                page_objects = page_envelope.get("objects", [])
-                                more_pages = page_envelope.get("more", False)
-
-                                if seen_count + len(page_objects) <= current_offset:
-                                    # Page is entirely before our offset — skip.
-                                    seen_count += len(page_objects)
-                                    if not more_pages:
-                                        break
-                                    continue
-
-                                # We've crossed the current_offset. Take what we need.
-                                start_in_page = max(0, current_offset - seen_count)
-                                collected.extend(page_objects[start_in_page:])
-                                seen_count += len(page_objects)
-
-                                # Stop if we have enough for this batch, OR no more pages.
-                                if len(collected) >= batch_size or not more_pages:
-                                    break
-
-                            batch_objects = collected[:batch_size]
-                        else:
-                            # Method 2: Direct response handling (no pagination support)
-                            if isinstance(response, dict):
-                                all_objects = response.get("objects", [])
-                            else:
-                                all_objects = response
-
-                            # Manually implement pagination
-                            start_idx = current_offset
-                            end_idx = current_offset + batch_size
-                            batch_objects = all_objects[start_idx:end_idx]
-
-                    except Exception as page_error:
-                        logger.warning(f"Pagination approach failed: {page_error}")
-                        # Fallback: use direct fetch with limit
-                        try:
-                            envelope = self.collection.get_objects(
-                                limit=batch_size * 10
-                            )  # Get more objects
-                            all_objects = envelope.get("objects", [])
-
-                            # Skip already processed objects
-                            start_idx = current_offset
-                            end_idx = current_offset + batch_size
-                            batch_objects = all_objects[start_idx:end_idx]
-
-                        except Exception as fetch_error:
-                            logger.error(
-                                f"All batch fetch methods failed: {fetch_error}"
-                            )
-                            batch_objects = []
-
-                    if not batch_objects:
-                        logger.info("✅ No more objects to process - completed")
-                        break
-
-                    batch_time = time.time() - batch_start_time
-                    total_processed += len(batch_objects)
-
-                    # Log batch statistics
-                    logger.info(f"📊 Batch {batch_count + 1} completed:")
-                    logger.info(f"   Objects in batch: {len(batch_objects)}")
-                    logger.info(f"   Processing time: {batch_time:.2f}s")
-                    logger.info(f"   Total processed: {total_processed}")
-                    logger.info(
-                        f"   Rate: {len(batch_objects) / batch_time:.1f} objects/sec"
-                    )
-
-                    # Log object type distribution for this batch
-                    batch_types = {}
-                    for obj in batch_objects:
-                        obj_type = (
-                            obj.get("type", "unknown")
-                            if isinstance(obj, dict)
-                            else getattr(obj, "type", "unknown")
-                        )
-                        batch_types[obj_type] = batch_types.get(obj_type, 0) + 1
-                    logger.info(f"   Types: {dict(sorted(batch_types.items()))}")
-
-                    # Cache progress after each batch
-                    if redis_client and redis_client.is_connected():
-                        try:
-                            progress_data = {
-                                "last_offset": current_offset
-                                + len(batch_objects),  # Save next offset
-                                "batch_count": batch_count + 1,
-                                "total_processed": total_processed,
-                                "last_run_time": datetime.now().isoformat(),
-                                "timestamp": time.time(),
-                            }
-                            redis_client.set_cached_data(
-                                cache_key, progress_data, ttl_seconds=86400
-                            )  # 24 hour TTL
-                            logger.info(
-                                f"💾 Saved progress: next offset {current_offset + len(batch_objects)}"
-                            )
-                        except Exception as e:
-                            logger.warning(f"Failed to cache progress: {e}")
-
-                    # Yield the batch for processing
-                    yield batch_objects
-
-                    # Update counters for next iteration
-                    current_offset += len(batch_objects)
-                    batch_count += 1
-
-                    # Resource management: rest between batches
-                    if rest_seconds > 0:
+                        progress_data = {
+                            "last_offset": current_offset
+                            + len(batch_objects),  # Save next offset
+                            "batch_count": batch_count + 1,
+                            "total_processed": total_processed,
+                            "last_run_time": datetime.now().isoformat(),
+                            "timestamp": time.time(),
+                        }
+                        redis_client.set_cached_data(
+                            cache_key, progress_data, ttl_seconds=86400
+                        )  # 24 hour TTL
                         logger.info(
-                            f"😴 Resting for {rest_seconds} seconds to manage system resources..."
+                            f"💾 Saved progress: next offset {current_offset + len(batch_objects)}"
                         )
-                        time.sleep(rest_seconds)
+                    except Exception as e:
+                        logger.warning(f"Failed to cache progress: {e}")
 
-                    # Memory management: suggest garbage collection for large batches
-                    if batch_size >= 5000:
-                        import gc
+                # Yield the batch for processing
+                yield batch_objects
 
-                        gc.collect()
+                # Update counters for next iteration
+                current_offset += len(batch_objects)
+                batch_count += 1
 
-                except Exception as batch_error:
-                    logger.error(
-                        f"Error processing batch {batch_count + 1}: {batch_error}"
+                # Resource management: rest between batches
+                if rest_seconds > 0:
+                    logger.info(
+                        f"😴 Resting for {rest_seconds} seconds to manage system resources..."
                     )
-                    # Continue with next batch instead of failing completely
-                    current_offset += batch_size  # Skip this batch
-                    continue
+                    time.sleep(rest_seconds)
+
+                # Memory management: suggest garbage collection for large batches
+                if batch_size >= 5000:
+                    import gc
+
+                    gc.collect()
 
             # Clear progress cache when completed successfully
             if redis_client and redis_client.is_connected():
