@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Tuple, Optional, Set
 from urllib3.exceptions import InsecureRequestWarning
 import warnings
 
+import requests
 import taxii2client.v21 as taxii21
 from stix2 import MemoryStore, parse
 
@@ -25,6 +26,8 @@ class TAXIIClient:
         verify_ssl,
         request_timeout=60,
         chunk_size=100,
+        page_retries=3,
+        page_retry_backoff=2.0,
     ):
         self.discovery_url = discovery_url
         self.username = username
@@ -32,6 +35,14 @@ class TAXIIClient:
         self.verify_ssl = verify_ssl
         self.request_timeout = request_timeout
         self.chunk_size = chunk_size
+        # Retry policy for transient TAXII connection failures
+        # (RemoteDisconnected, ConnectionResetError, ReadTimeout).
+        # TAXII servers / nginx proxies often drop keepalive sockets after
+        # ~30-60s of inactivity; paginating a 100k+ object collection
+        # with a 60s+ page time triggers this. We retry the failed page
+        # up to `page_retries` times with mild exponential backoff.
+        self.page_retries = page_retries
+        self.page_retry_backoff = page_retry_backoff
         self.server = None
         self.api_root = None
         self.collection = None
@@ -147,25 +158,89 @@ class TAXIIClient:
                 # `batch_size` (10k) objects regardless of how big the
                 # collection was.
                 #
-                # taxii21.as_pages(collection.get_objects, per_request=N)
-                # yields successive envelopes, each containing
-                # {"objects": [...], "more": bool, "next": str}.
+                # CRITICAL: the HTTP page size is decoupled from the
+                # processing batch size. A page_size of 2000 keeps each
+                # HTTP call under ~3s, well under any nginx/OpenTAXII
+                # proxy_read_timeout (default 60s). The OpenTAXII server can
+                # render 2000 objects in well under 1 second.
+                #
+                # batch_size (10k) is then used locally to slice the
+                # accumulated stream into manageable chunks for MISP
+                # processing.
                 # ------------------------------------------------------------------
+                # Use a small HTTP page_size — large collections (>50k) trip
+                # RemoteDisconnected on the upstream proxy when a single
+                # response takes >~30s to render.
+                http_page_size = min(batch_size, 2000)
                 logger.info(
                     f"Fetching full collection stream using taxii21.as_pages "
-                    f"(per_request={batch_size})"
+                    f"(HTTP page_size={http_page_size}, "
+                    f"local batch_size={batch_size})"
                 )
-                for envelope in taxii21.as_pages(
-                    self.collection.get_objects, per_request=batch_size
-                ):
+
+                def _page_with_retry(per_request, **kwargs):
+                    """Wrap taxii21.as_pages to retry on transient connection
+                    drops (RemoteDisconnected, ConnectionResetError, etc).
+                    Retries up to N times with linear backoff."""
+                    max_attempts = max(1, self.page_retries + 1)
+                    backoff = self.page_retry_backoff
+                    last_err = None
+                    for attempt in range(1, max_attempts + 1):
+                        try:
+                            # taxii21.as_pages is a generator; iterate it
+                            # once and re-create on error.
+                            for env in taxii21.as_pages(
+                                self.collection.get_objects,
+                                per_request=per_request,
+                                **kwargs,
+                            ):
+                                yield env
+                            return  # generator exhausted cleanly
+                        except (
+                            requests.exceptions.ConnectionError,
+                            requests.exceptions.ChunkedEncodingError,
+                            requests.exceptions.ReadTimeout,
+                            requests.exceptions.RemoteDisconnected,
+                            ConnectionResetError,
+                        ) as e:
+                            last_err = e
+                            if attempt >= max_attempts:
+                                logger.error(
+                                    f"  Page fetch failed after {attempt} "
+                                    f"attempts: {type(e).__name__}: {e}"
+                                )
+                                raise
+                            logger.warning(
+                                f"  Page fetch attempt {attempt}/{max_attempts} "
+                                f"failed ({type(e).__name__}: {e}); "
+                                f"retrying in {backoff:.1f}s"
+                            )
+                            time.sleep(backoff)
+                            backoff *= 1.5  # mild exponential backoff
+                    # unreachable, but be defensive
+                    raise (
+                        last_err
+                        if last_err
+                        else RuntimeError("page fetch exhausted attempts")
+                    )
+
+                pages_fetched = 0
+                for envelope in _page_with_retry(http_page_size):
+                    pages_fetched += 1
                     page_objects = envelope.get("objects", [])
                     all_objects.extend(page_objects)
-                    logger.info(
-                        f"  Page received: +{len(page_objects)} objects "
-                        f"(total {len(all_objects)}, more={envelope.get('more', False)})"
-                    )
+                    if pages_fetched % 10 == 1 or pages_fetched < 5:
+                        logger.info(
+                            f"  Page {pages_fetched}: +{len(page_objects)} "
+                            f"objects (total {len(all_objects)}, "
+                            f"more={envelope.get('more', False)})"
+                        )
                     if not envelope.get("more", False):
                         break
+                logger.info(
+                    f"  Fetched {pages_fetched} page(s), "
+                    f"{len(all_objects)} total objects"
+                )
             except Exception as e:
                 fetch_error = e
                 logger.warning(f"Full-collection fetch failed: {e}")
