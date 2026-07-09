@@ -281,7 +281,7 @@ def _fetch_manifest_page(
     args: List[Any] = [collection_id] + cursor_args + [limit + 1]
 
     rebuilt = (
-        "SELECT id::text, collection_id::text, type, spec_version,\n"
+        "SELECT id::text, pk::text AS pk, collection_id::text, type, spec_version,\n"
         "       version::text AS version, date_added::text AS date_added,\n"
         "       ('application/stix+json;version=' || spec_version)\n"
         "           AS media_type\n"
