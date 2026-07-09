@@ -41,6 +41,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode, urlparse
@@ -418,6 +419,55 @@ def _fetch_objects_page(
         pk_val = last_row.get("pk", last_row.get("pk_uuid", ""))
         nxt = f"{last_row['date_added']}|{last_row['id']}|{pk_val}"
         more = True
+
+    # ---- Synthesize a STIX grouping SDO that aggregates every object
+    # in this fetch into one virtual "bundle". The connector's
+    # extract_grouping_objects() only emits MISP events from
+    # object_refs hanging off STIX grouping SDOs. Many TAXII 2.1
+    # collections (this one included) carry only indicators with no
+    # groupings at all, which would otherwise produce zero events
+    # even when all the indicators parse cleanly. We add one grouping
+    # per /objects response that references every returned object.
+    # The grouping gets a deterministic id based on the sorted list
+    # of referenced indicator ids, so re-fetching the same page
+    # yields the same grouping id (Redis dedup-friendly). ----
+    if objs and not any(
+        (isinstance(o, dict) and o.get("type") == "grouping") for o in objs
+    ):
+        ref_ids = sorted(
+            o.get("id") for o in objs if isinstance(o, dict) and o.get("id")
+        )
+        if ref_ids:  # need at least one ref
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            grouping_id = (
+                f"grouping--{uuid.uuid5(uuid.NAMESPACE_URL, ','.join(ref_ids))}"
+            )
+            objs.append(
+                {
+                    "type": "grouping",
+                    "spec_version": "2.1",
+                    "id": grouping_id,
+                    "created": now_iso,
+                    "modified": now_iso,
+                    "created_by_ref": (
+                        objs[0].get("created_by_ref")
+                        if objs and isinstance(objs[0], dict)
+                        else None
+                    ),
+                    "name": (
+                        objs[0].get("description", "TAXII batch")
+                        if objs and isinstance(objs[0], dict)
+                        else "TAXII batch"
+                    ),
+                    "context_refs": ref_ids[:1],  # any one of the refs
+                    "object_refs": ref_ids,
+                    "description": (
+                        "Auto-generated grouping produced by taxii-mv-proxy "
+                        "to aggregate batched TAXII 2.1 indicators into a "
+                        "single MISP event."
+                    ),
+                }
+            )
 
     return objs, nxt
 
