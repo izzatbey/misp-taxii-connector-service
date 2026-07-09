@@ -393,6 +393,9 @@ async def root_dynamic(full_path: str, request: Request):
     If the path matches /manifest/ or /objects/, serve it from the
     MV. Otherwise, forward to upstream OpenTAXII.
     """
+    # FastAPI strips the "/taxii2/" prefix from the path; the regex
+    # patterns below expect `taxii2/...` form, so re-attach it.
+    full_path = "taxii2/" + full_path.lstrip("/")
     full_url = "/" + full_path
     qs = request.url.query
 
