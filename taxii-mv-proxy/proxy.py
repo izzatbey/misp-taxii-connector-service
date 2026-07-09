@@ -332,32 +332,37 @@ def _fetch_objects_page(
     """
     conn = get_db()
 
-    # Build the actual SQL with placeholder positions:
-    sql = """
-        SELECT pk::text, id::text,
+    # We only emit the cursor predicate when there's an actual cursor.
+    # Without a cursor, we want all rows matching the WHERE clause —
+    # the tuple comparison vs NULL would exclude everything.
+    args: List[Any] = [collection_id]
+    args.append(bool(ids))
+    args.append(ids or [])
+
+    if next_cursor:
+        try:
+            da, oid, pk = next_cursor.split("|", 2)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="bad-next-cursor")
+        cursor_clause = "AND (date_added, id, pk) > (%s, %s, %s::uuid)"
+        args.extend([da, oid, pk])
+    else:
+        cursor_clause = ""
+
+    args.append(limit + 1)
+
+    sql = f"""
+        SELECT pk::text,
+               id::text,
                date_added::text AS date_added,
                serialized_data
         FROM opentaxii_stixobject_latest
         WHERE collection_id = %s
           AND (%s::boolean IS FALSE OR id = ANY(%s::text[]))
-          AND (date_added, id, pk) > (%s, %s, %s::uuid)
+          {cursor_clause}
         ORDER BY date_added, id, pk
         LIMIT %s
     """
-    args: List[Any] = [collection_id]
-    args.append(bool(ids))
-    args.append(ids or [])
-    if next_cursor:
-        try:
-            da, oid, pk = next_cursor.split("|", 2)
-            args.extend([da, oid, pk])
-        except ValueError:
-            raise HTTPException(status_code=400, detail="bad-next-cursor")
-    else:
-        # Use sentinel values that satisfy "greater than everything"
-        args.extend(["", "", "00000000-0000-0000-0000-000000000000"])
-
-    args.append(limit + 1)
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(sql, args)
