@@ -247,14 +247,15 @@ def _fetch_manifest_page(
     """
     sql = """
         SELECT
-            id::text                       AS id_text,
-            pk::text                       AS pk_text,
-            collection_id::text            AS collection_id_text,
-            type                           AS type_text,
-            spec_version                   AS spec_version_text,
-            version::text                  AS version_text,
-            date_added::text               AS date_added_text,
-            ('application/stix+json;version=' || spec_version) AS media_type
+            id::text,
+            pk::text                       AS pk_uuid,
+            collection_id::text,
+            type,
+            spec_version,
+            version::text,
+            date_added::text,
+            ('application/stix+json;version=' || spec_version)
+                AS media_type
         FROM opentaxii_stixobject_latest
         WHERE collection_id = %s::uuid
         %s
@@ -280,14 +281,15 @@ def _fetch_manifest_page(
     args: List[Any] = [collection_id] + cursor_args + [limit + 1]
 
     rebuilt = (
-        "SELECT id::text                       AS id_text,\n"
-        "       pk::text                       AS pk_text,\n"
-        "       collection_id::text            AS collection_id_text,\n"
-        "       type                           AS type_text,\n"
-        "       spec_version                   AS spec_version_text,\n"
-        "       version::text                  AS version_text,\n"
-        "       date_added::text               AS date_added_text,\n"
-        "       ('application/stix+json;version=' || spec_version) AS media_type\n"
+        "SELECT id::text,\n"
+        "       pk::text                       AS pk_uuid,\n"
+        "       collection_id::text,\n"
+        "       type,\n"
+        "       spec_version,\n"
+        "       version::text,\n"
+        "       date_added::text,\n"
+        "       ('application/stix+json;version=' || spec_version)\n"
+        "           AS media_type\n"
         "FROM opentaxii_stixobject_latest\n"
         "WHERE collection_id = %s\n"
         f"{cursor_pred}\n"
@@ -305,20 +307,11 @@ def _fetch_manifest_page(
     if len(rows) > limit:
         # Drop the lookahead row and compute next cursor from the
         # *last* row we keep. Cursor format: <date_added>|<id>|<pk>;
-        # pk is the actual uuid column, NOT a STIX id string.
+        # pk is the actual uuid column (aliased as pk_uuid), NOT a
+        # STIX id string.
         rows = rows[:limit]
         last = rows[-1]
-        # Use aliased column names. If something is missing, log and bail
-        # without raising so the proxy still produces output.
-        missing = [
-            k for k in ("date_added_text", "id_text", "pk_text") if k not in last
-        ]
-        if missing:
-            log.error(
-                f"manifest row missing keys {missing}; row keys: {list(last.keys())}"
-            )
-            return rows, None
-        nxt = f"{last['date_added_text']}|{last['id_text']}|{last['pk_text']}"
+        nxt = f"{last['date_added']}|{last['id']}|{last['pk_uuid']}"
         more = True
 
     return rows, nxt
@@ -387,7 +380,9 @@ def _fetch_objects_page(
     nxt: Optional[str] = None
     if len(objs) > limit and last_row is not None:
         objs = objs[:limit]
-        nxt = f"{last_row['date_added']}|{last_row['id']}|{last_row['pk']}"
+        # Use pk_uuid alias for consistency with _fetch_manifest_page.
+        pk_val = last_row.get("pk", last_row.get("pk_uuid", ""))
+        nxt = f"{last_row['date_added']}|{last_row['id']}|{pk_val}"
         more = True
 
     return objs, nxt
