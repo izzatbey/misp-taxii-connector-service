@@ -248,6 +248,7 @@ def _fetch_manifest_page(
     sql = """
         SELECT
             id::text,
+            pk::text AS pk,
             collection_id::text,
             type,
             spec_version,
@@ -264,6 +265,10 @@ def _fetch_manifest_page(
     cursor_pred = ""
     cursor_args: List[Any] = []
     if next_cursor:
+        # Cursor format: "<date_added>|<stix_id>|<pk_uuid>"
+        # Order columns in the row-comparator matches our ORDER BY tuple:
+        #   (date_added, id, pk) > (date_added, stix_id, pk)
+        # We cast the third param to ::uuid because pk is a uuid column.
         cursor_pred = "AND (date_added, id, pk) > (%s, %s, %s::uuid)"
         try:
             da, oid, pk = next_cursor.split("|", 2)
@@ -297,15 +302,11 @@ def _fetch_manifest_page(
     nxt: Optional[str] = None
     if len(rows) > limit:
         # Drop the lookahead row and compute next cursor from the
-        # *last* row we keep.
+        # *last* row we keep. Cursor format: <date_added>|<id>|<pk>;
+        # pk is the actual uuid column, NOT a STIX id string.
         rows = rows[:limit]
         last = rows[-1]
-        nxt = f"{last['date_added']}|{last['id']}|{last['id']}"  # pk==id for MV
-        # Note: the MV primary key is the same uuid as "id" because
-        # we used SELECT DISTINCT ON (collection_id, id) — there's
-        # exactly one physical row per logical object. So next-cursor
-        # is unambiguous. If you ever add a different pk, change
-        # this to fetch the last row's actual pk value.
+        nxt = f"{last['date_added']}|{last['id']}|{last['pk']}"
         more = True
 
     return rows, nxt
