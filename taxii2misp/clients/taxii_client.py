@@ -237,24 +237,20 @@ class TAXIIClient:
         )
 
         # --------------------------------------------------------------
-        # Per-fetch batch sizes.
+        # Per-fetch batch sizes — driven by `self.chunk_size` which
+        # came from settings.TAXII_CHUNK_SIZE (env var). Cap at 500
+        # because beyond that, URL-encoded /objects/?id=a,b,c requests
+        # can run into proxy URL-length limits.
         #
         # - manifest_batch_ids: how many IDs we accumulate from /manifest/
-        #   before triggering a /objects/ bulk-fetch + yield. Manifest
-        #   responses are tiny (a few KB), so we can buffer several
-        #   manifest pages into one object fetch without losing
-        #   responsiveness. 500 IDs is ~7 KB of STIX manifest — easily
-        #   fits in one HTTP roundtrip server-side.
-        #
+        #   before triggering a /objects/ bulk-fetch + yield.
         # - object_fetch_chunk: how many IDs per /objects/?id=a,b,c call.
-        #   The server has to render full STIX objects for this so we keep
-        #   it small (200 = well under OpenTAXII's worst-case render).
-        #
-        # - connect/read timeouts: 10s connect, 60s read. If the server
-        #   can't render a page in 60s it's sick and we'd rather bail.
+        # - http_timeout: (connect_seconds, read_seconds).
         # --------------------------------------------------------------
-        manifest_batch_ids = 500
-        object_fetch_chunk = max(50, min(200, int(batch_size or 200)))
+        manifest_batch_ids = max(50, min(500, int(self.chunk_size or 500)))
+        object_fetch_chunk = max(
+            50, min(500, int(batch_size or self.chunk_size or 500))
+        )
         http_timeout = (10, 60)
 
         cache_key = f"taxii_global_progress:{self.collection.id}"
@@ -1431,24 +1427,38 @@ class TAXIIClient:
             grouping_ids = []
 
             for obj in stix_objects:
+                # ---- Extract grouping IDs BEFORE attempting parse, so
+                # a stix2 library parse-error on the grouping object itself
+                # doesn't drop the grouping id (previously the parse was
+                # first, and any exception skipped the rest of the
+                # iteration including the grouping-id append).
+                if isinstance(obj, dict):
+                    if obj.get("type") == "grouping":
+                        gid = obj.get("id")
+                        if gid:
+                            grouping_ids.append(gid)
+                elif hasattr(obj, "type"):
+                    if obj.type == "grouping":
+                        grouping_ids.append(obj.id)
+
+                # ---- Now try to parse the object into a STIX SDO. We do
+                # this in a separate try/except per-object so a single
+                # parser failure doesn't take down the rest of the batch.
                 try:
                     if isinstance(obj, dict):
-                        # Parse the dictionary into a STIX object
                         parsed_obj = parse(obj, allow_custom=True)
                         parsed_objects.append(parsed_obj)
-
-                        # Collect grouping object IDs
-                        if obj.get("type") == "grouping":
-                            grouping_ids.append(obj.get("id"))
-
                     elif hasattr(obj, "type"):
-                        # Already a parsed STIX object
                         parsed_objects.append(obj)
-                        if obj.type == "grouping":
-                            grouping_ids.append(obj.id)
-
                 except Exception as parse_error:
                     logger.warning(f"Failed to parse STIX object: {parse_error}")
+                    # On parse failure, fall back to a hand-rolled STIX
+                    # Indicator object so we still keep its data in the
+                    # memory store as a basic python dict. This avoids
+                    # "Failed to parse" silent drops for malformed
+                    # objects.
+                    if isinstance(obj, dict) and obj.get("pattern"):
+                        parsed_objects.append(obj)
                     continue
 
             if not parsed_objects:
