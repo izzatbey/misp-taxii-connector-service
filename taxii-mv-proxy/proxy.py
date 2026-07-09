@@ -391,33 +391,64 @@ def _taxii_public_url() -> str:
     return base + "/"
 
 
-def _collection_title_map() -> Dict[str, str]:
-    """Return {collection_id (str): title} from opentaxii_collection.
-    One roundtrip, sub-millisecond."""
+# Schema introspection — OpenTAXII's collection table may use
+# 'name', 'title', or some other column; we discover on first hit
+# and cache the result.
+_COLLECTION_TITLE_COLUMN: Optional[str] = None
+
+
+def _resolve_collection_title_column() -> Optional[str]:
+    """Find which column in opentaxii_collection gives us a human-
+    readable title. Caches result."""
+    global _COLLECTION_TITLE_COLUMN
+    if _COLLECTION_TITLE_COLUMN is not None:
+        return _COLLECTION_TITLE_COLUMN
     conn = get_db()
     with conn.cursor() as cur:
-        cur.execute("SELECT id::text, name FROM opentaxii_collection")
-        return {row[0]: row[1] for row in cur.fetchall()}
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'opentaxii_collection'"
+        )
+        cols = [r[0] for r in cur.fetchall()]
+    for candidate in ("name", "title"):
+        if candidate in cols:
+            _COLLECTION_TITLE_COLUMN = candidate
+            return candidate
+    _COLLECTION_TITLE_COLUMN = None
+    return None
+
+
+def _collection_rows() -> List[Tuple[str, Optional[str]]]:
+    """Return [(id, title_or_None), ...] from opentaxii_collection.
+    Discovers title column on first call."""
+    title_col = _resolve_collection_title_column()
+    conn = get_db()
+    with conn.cursor() as cur:
+        if title_col:
+            cur.execute(f"SELECT id::text, {title_col} FROM opentaxii_collection")
+        else:
+            cur.execute("SELECT id::text FROM opentaxii_collection")
+        return [(r[0], r[1] if title_col else None) for r in cur.fetchall()]
+
+
+def _collection_title_map() -> Dict[str, str]:
+    """Return {collection_id (str): title} from opentaxii_collection."""
+    rows = _collection_rows()
+    return {cid: (title or f"Collection {cid[:8]}…") for cid, title in rows}
 
 
 def _api_roots_from_db() -> List[Dict[str, Any]]:
-    """Build the TAXII 2.1 API-roots payload from the single API root
-    we know about. The id is derived from the collection's parent
-    api_root_id; we surface all collections we know about.
-    """
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("SELECT id::text, name FROM opentaxii_collection")
-        cols = list(cur.fetchall())
-    if not cols:
+    """Build the TAXII 2.1 API-roots payload from known collections."""
+    rows = _collection_rows()
+    if not rows:
         # Fallback: synthesise one collection from DEFAULT_COLLECTION_ID
-        cols = (
+        rows = (
             [(DEFAULT_COLLECTION_ID, "SOCollection")] if DEFAULT_COLLECTION_ID else []
         )
     # We expose a single stable API root UUID. Any UUID works as long
     # as it's consistent across requests so the connector can build
     # /api-root-id/collections/... URLs.
-    api_root_id = cols[0][0] if cols else "default-api-root"
+    api_root_id = rows[0][0] if rows else "default-api-root"
     # We can't easily reach the api-root URL path the connector builds
     # without knowing the api_root_id. Easiest is to expose every
     # collection under each known collection_id as its own api root,
