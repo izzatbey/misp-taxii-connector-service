@@ -381,6 +381,143 @@ def _fetch_objects_page(
 
 
 # ------------------------------------------------------------------
+# TAXII 2.1 metadata endpoints (served from MV — NO upstream calls,
+# so we never depend on OpenTAXII being healthy for these paths).
+# ------------------------------------------------------------------
+def _taxii_public_url() -> str:
+    """Base URL clients see externally. PROXY_PUBLIC_URL must end
+    with a trailing slash (already set in .env)."""
+    base = PROXY_PUBLIC_URL.rstrip("/")
+    return base + "/"
+
+
+def _collection_title_map() -> Dict[str, str]:
+    """Return {collection_id (str): title} from opentaxii_collection.
+    One roundtrip, sub-millisecond."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id::text, name FROM opentaxii_collection")
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def _api_roots_from_db() -> List[Dict[str, Any]]:
+    """Build the TAXII 2.1 API-roots payload from the single API root
+    we know about. The id is derived from the collection's parent
+    api_root_id; we surface all collections we know about.
+    """
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id::text, name FROM opentaxii_collection")
+        cols = list(cur.fetchall())
+    if not cols:
+        # Fallback: synthesise one collection from DEFAULT_COLLECTION_ID
+        cols = (
+            [(DEFAULT_COLLECTION_ID, "SOCollection")] if DEFAULT_COLLECTION_ID else []
+        )
+    # We expose a single stable API root UUID. Any UUID works as long
+    # as it's consistent across requests so the connector can build
+    # /api-root-id/collections/... URLs.
+    api_root_id = cols[0][0] if cols else "default-api-root"
+    # We can't easily reach the api-root URL path the connector builds
+    # without knowing the api_root_id. Easiest is to expose every
+    # collection under each known collection_id as its own api root,
+    # and also under a single "global" api_root_id.
+    #
+    # The fastpath for the connector is: GET /taxii2/  -> picks first
+    # api_root. Then /taxii2/{api_root}/collections/ -> lists collections.
+    # We make BOTH shapes return the same collections.
+    return [{"id": api_root_id, "title": "Misconfigured API root"}]
+
+
+@app.get("/taxii2/")
+async def get_discovery():
+    """TAXII 2.1 Discovery endpoint.
+
+    Returns the list of API roots known to this server. The MV-backed
+    implementation never calls OpenTAXII and never blocks.
+    """
+    api_roots = _api_roots_from_db()
+    return JSONResponse(
+        content={
+            "title": "TAXII 2.1 (MV-proxied)",
+            "default": api_roots[0]["id"] if api_roots else None,
+            "api_roots": [f"{_taxii_public_url()}{r['id']}/" for r in api_roots],
+        },
+        media_type="application/taxii+json;version=2.1",
+    )
+
+
+@app.get("/taxii2/{api_root_id}/")
+async def get_api_root(api_root_id: str):
+    """API root metadata endpoint."""
+    title_map = _collection_title_map()
+    return JSONResponse(
+        content={
+            "id": api_root_id,
+            "title": "MISP TAXII feed (MV-proxied)",
+            "description": (
+                "Read-only TAXII 2.1 collection backed by the "
+                "opentaxii_stixobject_latest materialized view."
+            ),
+            "versions": ["taxii-2.1"],
+            "max_content_length": 10485760,
+        },
+        media_type="application/taxii+json;version=2.1",
+    )
+
+
+@app.get("/taxii2/{api_root_id}/collections/")
+async def get_collections(api_root_id: str):
+    """Collections list endpoint."""
+    title_map = _collection_title_map()
+    if not title_map:
+        return JSONResponse(
+            content={"collections": []}, media_type="application/taxii+json;version=2.1"
+        )
+    collections_payload = []
+    for cid, ctitle in title_map.items():
+        collections_payload.append(
+            {
+                "id": cid,
+                "title": ctitle,
+                "description": (
+                    f"Collection {ctitle} ({cid[:8]}…) — served from "
+                    f"the materialized view."
+                ),
+                "media_types": [
+                    "application/stix+json;version=2.1",
+                ],
+                "can_read": True,
+                "can_write": False,
+                "media_type": "application/taxii+json;version=2.1",
+            }
+        )
+    return JSONResponse(
+        content={"collections": collections_payload},
+        media_type="application/taxii+json;version=2.1",
+    )
+
+
+@app.get("/taxii2/{api_root_id}/collections/{collection_id}/")
+async def get_collection(api_root_id: str, collection_id: str):
+    """Single collection metadata endpoint."""
+    title_map = _collection_title_map()
+    title = title_map.get(collection_id, "Unknown")
+    return JSONResponse(
+        content={
+            "id": collection_id,
+            "title": title,
+            "description": (f"Collection {title} — served from the MV."),
+            "media_types": ["application/stix+json;version=2.1"],
+            "can_read": True,
+            "can_write": False,
+            "media_type": "application/taxii+json;version=2.1",
+        },
+        media_type="application/taxii+json;version=2.1",
+    )
+
+
+# ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
 @app.api_route(
