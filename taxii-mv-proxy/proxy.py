@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import json
+import uuid
 import logging
 import os
 import re
@@ -378,6 +379,34 @@ def _fetch_objects_page(
             obj = json.loads(sd)
         else:
             obj = sd
+
+        # ---- Wrap malformed STIX dicts so the downstream
+        # stix2.v21.parse() doesn't reject them. Some upstreams pushed
+        # bare pattern dicts lacking the mandatory top-level
+        # "type"/"id" fields. We detect that shape (a dict with
+        # `pattern`/`pattern_type` but no "type") and lift it into a
+        # proper STIX 2.1 indicator object. ----
+        if isinstance(obj, dict) and "type" not in obj:
+            pattern = obj.get("pattern") or ""
+            obj = {
+                "type": "indicator",
+                "spec_version": obj.get("spec_version", "2.1"),
+                "id": obj.get("id")
+                or f"indicator--{uuid.uuid5(uuid.NAMESPACE_URL, str(obj.get('created', '')) + str(pattern))}",
+                "created": obj.get("created"),
+                "modified": obj.get("modified"),
+                "created_by_ref": obj.get("created_by_ref"),
+                "description": obj.get("description", ""),
+                "indicator_types": obj.get("indicator_types", ["malicious-activity"]),
+                "pattern_type": obj.get("pattern_type", "stix"),
+                "pattern_version": obj.get("pattern_version", "2.1"),
+                "pattern": pattern,
+                "valid_from": obj.get("valid_from"),
+                "valid_until": obj.get("valid_until"),
+                "object_marking_refs": obj.get("object_marking_refs", []),
+                "extensions": obj.get("extensions", {}),
+            }
+
         objs.append(obj)
         last_row = r
 
