@@ -293,10 +293,9 @@ def _fetch_manifest_page(
     )
 
     conn = get_db()
-    with conn.cursor() as cur:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(rebuilt, args)
-        cols = [c.name for c in cur.description]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = cur.fetchall()
 
     more = False
     nxt: Optional[str] = None
