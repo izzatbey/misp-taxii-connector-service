@@ -1,0 +1,31 @@
+version: "3.8"
+
+# Standalone compose file for the TAXII MV-Proxy.
+# It joins the same docker network as opentaxii-1 and db-1 so the
+# proxy can reach them by service name.
+
+services:
+  taxii-mv-proxy:
+    build: .
+    container_name: taxii-mv-proxy
+    restart: unless-stopped
+    env_file:
+      - .env
+    # The proxy runs on host port 9000 so the connector's existing
+    # DISCOVERY_URL=https://10.80.150.113:9000/taxii2/ continues to
+    # work unchanged. Update the listener if your docker-compose has
+    # port 9000 already bound (e.g., by opentaxii-1).
+    ports:
+      - "9000:9000"
+    # Same docker network as opentaxii and db-1. If yours is named
+    # differently (e.g., examples_default), adjust here.
+    networks:
+      - opentaxii-network
+
+networks:
+  opentaxii-network:
+    # If this compose is run alongside an existing opentaxii
+    # compose, point this at that compose's external network:
+    # external: true
+    # name: examples_opentaxii-network
+    driver: bridge

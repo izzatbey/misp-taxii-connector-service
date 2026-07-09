@@ -1,5 +1,6 @@
 import logging
 import time
+import json
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple, Optional, Set
 from urllib3.exceptions import InsecureRequestWarning
@@ -83,304 +84,484 @@ class TAXIIClient:
             logger.error(f"Failed to initialize TAXII client: {e}")
             raise
 
+    # ------------------------------------------------------------------
+    # Internal HTTP helpers (bypass taxii2client's quirks).
+    #
+    # The taxii2client library always sends `?limit=N` as a query param
+    # (see taxii2client/common.py:_filter_kwargs_to_query_params). On the
+    # OpenTAXII server in this stack, that means every /objects/ and
+    # /manifest/ call materialises the entire remaining collection server-
+    # side and streams it in one response — multi-minute renders, Postgres
+    # joins eating host RAM, "stalled" cycles that never complete.
+    #
+    # We bypass that by:
+    #   1) walking /manifest/ (returns *only* IDs + timestamps, not full
+    #      STIX objects — tiny response, fast server render even at 100k
+    #      objects), and
+    #   2) issuing raw `requests` with NO `?limit=` parameter and tight
+    #      per-page connect/read timeouts. The server returns its own
+    #      internal page size (the OpenTAXII default is small enough to
+    #      respond in ~1s).
+    # ------------------------------------------------------------------
+    def _http_session(self) -> requests.Session:
+        """Return the underlying requests.Session for raw HTTP calls."""
+        # taxii2client shares a Session across collections of the same
+        # ApiRoot, so we reuse whatever the library set up (auth + verify
+        # already configured). Fall back to a fresh Session if the
+        # private attribute is ever renamed.
+        try:
+            return self.collection._conn.session  # type: ignore[attr-defined]
+        except AttributeError:
+            sess = requests.Session()
+            if self.username and self.password:
+                import requests.auth as _ra
+
+                sess.auth = _ra.HTTPBasicAuth(self.username, self.password)
+            sess.verify = bool(self.verify_ssl)
+            return sess
+
+    def _manifest_url(self) -> str:
+        """Return the manifest endpoint URL for the current collection."""
+        # collection.url already ends with the collection id and a slash
+        base = self.collection.url
+        if not base.endswith("/"):
+            base = base + "/"
+        return base + "manifest/"
+
+    def _objects_url(self) -> str:
+        """Return the objects endpoint URL for the current collection."""
+        base = self.collection.url
+        if not base.endswith("/"):
+            base = base + "/"
+        return base + "objects/"
+
+    def _raw_get_json(
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Tuple[int, int] = (10, 60),
+    ) -> Tuple[Dict[str, Any], int, Optional[str]]:
+        """
+        Issue a raw HTTP GET against the TAXII server, bypassing
+        taxii2client.get_objects/get_manifest (both add `limit` query
+        params we don't want).
+
+        Args:
+            url: full URL
+            params: query parameters (NONE may include 'limit')
+            timeout: (connect_timeout, read_timeout) seconds
+
+        Returns:
+            (json_body, status_code, next_cursor) — may raise on transport
+            errors so the caller can retry.
+
+        Raises:
+            requests.exceptions.RequestException — for transport errors
+            json.JSONDecodeError — if response is not JSON
+        """
+        sess = self._http_session()
+        resp = sess.get(url, params=params or None, timeout=timeout)
+        status = resp.status_code
+        next_hdr = resp.headers.get("X-TAXII-Date")  # debugging sanity
+        body: Dict[str, Any] = {}
+        try:
+            body = resp.json()
+        except ValueError:
+            # Not JSON — caller decides what to do (typically HTTPError).
+            resp.raise_for_status()
+        # Spec: pagination cursor lives in body.more and body.next
+        return body, status, body.get("next") if isinstance(body, dict) else None
+
     def get_all_objects_with_resource_management(
         self, redis_client=None, batch_size=10000, rest_seconds=5
     ):
         """
-        Resource-aware STIX object retrieval with Redis caching and memory management.
-        Processes objects in batches to prevent system crashes with large datasets.
+        Streaming, resource-aware STIX object retrieval via TAXII /manifest/.
+
+        FIXED (2026-07-09 v2): rewritten to walk /manifest/ instead of
+        /objects/. The previous version of this method (and the one before
+        it) called self.collection.get_objects(limit=...). On the
+        OpenTAXII server backing this stack, that consistently hung for
+        2+ minutes per call because OpenTAXII's /objects/ materialises
+        the entire remaining collection server-side regardless of the
+        `limit` query param (its Postgres backend is the slow part — it
+        was eating 31% of host RAM).
+
+        Manifest-walking is fundamentally lighter:
+          - each envelope contains only object IDs, timestamps, version,
+            and media_type — not full STIX objects.
+          - typical per-page response: a few KB even at 10k objects.
+          - per-call server render: ~1s on large collections.
+
+        We then batch-fetch the *full* STIX objects by ID (in groups of
+        `http_page_size`, default 200) using /objects/?id=<a,b,c>. Each
+        /objects/ call is bounded so the server can't blow up.
+
+        Caller contract is unchanged from the v1 streaming rewrite:
+        yields one batch (a list of STIX object dicts) per outer iteration.
 
         Args:
-            redis_client: Redis client for caching progress
-            batch_size: Number of objects to process per batch (default: 10000)
-            rest_seconds: Seconds to rest between batches (default: 5)
-
-        Returns:
-            Generator yielding batches of STIX objects
+            redis_client: Redis client for caching progress (optional)
+            batch_size:   preferred objects per yielded batch. We honour
+                          it for the /objects/ fetch granularity; the
+                          manifest walk defaults to a per-page cache of
+                          500 IDs (~few KB per response).
+            rest_seconds: seconds to rest between successful batches
         """
+        import gc
+
         logger.info(
-            f"🚀 Starting resource-managed retrieval (batch_size={batch_size}, rest={rest_seconds}s)"
+            f"🚀 Starting STREAMING resource-managed retrieval "
+            f"(batch_size={batch_size}, rest={rest_seconds}s)"
         )
 
+        # --------------------------------------------------------------
+        # Resolve the exceptions we'll catch. Newer `requests` versions
+        # don't always expose RemoteDisconnected at the top level (it's
+        # an alias of ConnectionError), so attribute access itself can
+        # raise AttributeError — which silently aborted every fetch
+        # before. Resolve once, defensively.
+        # --------------------------------------------------------------
         try:
-            # Check if we have cached progress for GLOBAL processing state
-            cache_key = f"taxii_global_progress:{self.collection.id}"
-            last_processed_offset = 0
+            _remote_disconnected_exc = requests.exceptions.RemoteDisconnected
+        except AttributeError:
+            _remote_disconnected_exc = requests.exceptions.ConnectionError
 
-            if redis_client and redis_client.is_connected():
-                try:
-                    cached_progress = redis_client.get_cached_data(cache_key)
-                    if cached_progress:
-                        last_processed_offset = int(
-                            cached_progress.get("last_offset", 0)
-                        )
-                        last_run_time = cached_progress.get("last_run_time", "")
-                        logger.info(
-                            f"📋 Resuming GLOBAL processing from cached position: offset {last_processed_offset}"
-                        )
-                        logger.info(f"   Last run: {last_run_time}")
-                    else:
-                        logger.info("🆕 No cached progress found - starting fresh")
-                except Exception as e:
-                    logger.warning(f"Failed to read cached progress: {e}")
+        _transport_errors = (
+            requests.exceptions.ConnectionError,  # covers RemoteDisconnected
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.Timeout,
+            OSError,
+            ConnectionResetError,
+        )
 
-            # Use pagination with resource management
-            current_offset = last_processed_offset
-            batch_count = 0
-            total_processed = last_processed_offset
+        # --------------------------------------------------------------
+        # Per-fetch batch sizes.
+        #
+        # - manifest_batch_ids: how many IDs we accumulate from /manifest/
+        #   before triggering a /objects/ bulk-fetch + yield. Manifest
+        #   responses are tiny (a few KB), so we can buffer several
+        #   manifest pages into one object fetch without losing
+        #   responsiveness. 500 IDs is ~7 KB of STIX manifest — easily
+        #   fits in one HTTP roundtrip server-side.
+        #
+        # - object_fetch_chunk: how many IDs per /objects/?id=a,b,c call.
+        #   The server has to render full STIX objects for this so we keep
+        #   it small (200 = well under OpenTAXII's worst-case render).
+        #
+        # - connect/read timeouts: 10s connect, 60s read. If the server
+        #   can't render a page in 60s it's sick and we'd rather bail.
+        # --------------------------------------------------------------
+        manifest_batch_ids = 500
+        object_fetch_chunk = max(50, min(200, int(batch_size or 200)))
+        http_timeout = (10, 60)
 
-            # --------------------------------------------------------------
-            # Fetch the entire collection up front (one big stream), then
-            # slice it into batches. The previous implementation called
-            # `get_objects(limit=batch_size)` once per batch and tried to
-            # skip ahead via offset, but the TAXII 2.1 client library
-            # doesn't honour offset — every call returns the first
-            # `limit` objects, so batch 2+ were always empty for a
-            # collection with >batch_size objects.
-            # --------------------------------------------------------------
-            logger.info(
-                f"Fetching full collection stream (limit={batch_size} per "
-                f"HTTP call, will accumulate all pages)"
-            )
+        cache_key = f"taxii_global_progress:{self.collection.id}"
+        completion_key = f"taxii_completion:{self.collection.id}"
 
-            all_objects = []
-            fetch_error = None
+        # --------------------------------------------------------------
+        # Resume state for the manifest walk.
+        # --------------------------------------------------------------
+        next_manifest_cursor: Optional[str] = None
+        page_index = 0
+        total_objects_yielded = 0
+        if redis_client and redis_client.is_connected():
             try:
-                # ------------------------------------------------------------------
-                # CORRECT pagination: use the module-level taxii21.as_pages()
-                # helper, which loops over envelopes and follows the server's
-                # `next` cursor until `more: false`.
-                #
-                # The previous implementation did `response.as_pages()` on the
-                # dict returned by get_objects(), which never worked — dicts
-                # don't have an as_pages attribute — so the code silently
-                # fell through to single-page mode, fetching only the first
-                # `batch_size` (10k) objects regardless of how big the
-                # collection was.
-                #
-                # CRITICAL: the HTTP page size is decoupled from the
-                # processing batch size. A page_size of 2000 keeps each
-                # HTTP call under ~3s, well under any nginx/OpenTAXII
-                # proxy_read_timeout (default 60s). The OpenTAXII server can
-                # render 2000 objects in well under 1 second.
-                #
-                # batch_size (10k) is then used locally to slice the
-                # accumulated stream into manageable chunks for MISP
-                # processing.
-                # ------------------------------------------------------------------
-                # Use a small HTTP page_size — large collections (>50k) trip
-                # RemoteDisconnected on the upstream proxy when a single
-                # response takes >~30s to render.
-                http_page_size = min(batch_size, 2000)
-                logger.info(
-                    f"Fetching full collection stream using taxii21.as_pages "
-                    f"(HTTP page_size={http_page_size}, "
-                    f"local batch_size={batch_size})"
-                )
-
-                def _page_with_retry(per_request, **kwargs):
-                    """Wrap taxii21.as_pages to retry on transient connection
-                    drops (RemoteDisconnected, ConnectionResetError, etc).
-                    Retries up to N times with linear backoff."""
-                    max_attempts = max(1, self.page_retries + 1)
-                    backoff = self.page_retry_backoff
-                    last_err = None
-                    for attempt in range(1, max_attempts + 1):
-                        try:
-                            # taxii21.as_pages is a generator; iterate it
-                            # once and re-create on error.
-                            for env in taxii21.as_pages(
-                                self.collection.get_objects,
-                                per_request=per_request,
-                                **kwargs,
-                            ):
-                                yield env
-                            return  # generator exhausted cleanly
-                        except (
-                            requests.exceptions.ConnectionError,
-                            requests.exceptions.ChunkedEncodingError,
-                            requests.exceptions.ReadTimeout,
-                            requests.exceptions.RemoteDisconnected,
-                            ConnectionResetError,
-                        ) as e:
-                            last_err = e
-                            if attempt >= max_attempts:
-                                logger.error(
-                                    f"  Page fetch failed after {attempt} "
-                                    f"attempts: {type(e).__name__}: {e}"
-                                )
-                                raise
-                            logger.warning(
-                                f"  Page fetch attempt {attempt}/{max_attempts} "
-                                f"failed ({type(e).__name__}: {e}); "
-                                f"retrying in {backoff:.1f}s"
-                            )
-                            time.sleep(backoff)
-                            backoff *= 1.5  # mild exponential backoff
-                    # unreachable, but be defensive
-                    raise (
-                        last_err
-                        if last_err
-                        else RuntimeError("page fetch exhausted attempts")
-                    )
-
-                pages_fetched = 0
-                for envelope in _page_with_retry(http_page_size):
-                    pages_fetched += 1
-                    page_objects = envelope.get("objects", [])
-                    all_objects.extend(page_objects)
-                    if pages_fetched % 10 == 1 or pages_fetched < 5:
+                cached = redis_client.get_cached_data(cache_key)
+                if cached:
+                    next_manifest_cursor = cached.get("next_cursor") or None
+                    page_index = int(cached.get("last_page_index", 0))
+                    total_objects_yielded = int(cached.get("total_processed", 0))
+                    if next_manifest_cursor:
                         logger.info(
-                            f"  Page {pages_fetched}: +{len(page_objects)} "
-                            f"objects (total {len(all_objects)}, "
-                            f"more={envelope.get('more', False)})"
+                            f"📋 Resuming manifest walk from cached cursor "
+                            f"(page {page_index}, "
+                            f"{total_objects_yielded} objects "
+                            f"already yielded last run)"
                         )
-                    if not envelope.get("more", False):
-                        break
-                logger.info(
-                    f"  Fetched {pages_fetched} page(s), "
-                    f"{len(all_objects)} total objects"
-                )
-            except Exception as e:
-                fetch_error = e
-                logger.warning(f"Full-collection fetch failed: {e}")
-                all_objects = []
-
-            logger.info(
-                f"Fetched {len(all_objects)} total objects from TAXII collection"
-            )
-
-            # Now slice into batches
-            total = len(all_objects)
-            if total == 0:
-                logger.info("✅ No more objects to process - completed")
-                if redis_client and redis_client.is_connected():
+                completed = redis_client.get_cached_data(completion_key)
+                if completed and not next_manifest_cursor:
+                    logger.info(
+                        f"✅ Last run completed cleanly at "
+                        f"{completed.get('completed_at')} — re-walking "
+                        f"fresh; Redis dedup handles updates"
+                    )
                     try:
-                        redis_client.set_cached_data(
-                            cache_key,
-                            {
-                                "last_offset": 0,
-                                "batch_count": 0,
-                                "total_processed": 0,
-                                "last_run_time": "",
-                            },
-                            ttl_seconds=86400,
-                        )
+                        redis_client._redis_client.delete(cache_key)
                     except Exception:
                         pass
-                return
+                    page_index = 0
+                    total_objects_yielded = 0
+            except Exception as e:
+                logger.warning(f"Failed to read checkpoint state: {e}")
 
-            while current_offset < total:
+        logger.info(
+            f"📡 Streaming TAXII collection via /manifest/ → /objects/ "
+            f"(manifest_batch_ids={manifest_batch_ids}, "
+            f"object_fetch_chunk={object_fetch_chunk}, "
+            f"batch_size={batch_size}, "
+            f"resume={'yes' if next_manifest_cursor else 'no'})"
+        )
+
+        consecutive_failures = 0
+        max_consecutive_failures = max(2, getattr(self, "page_retries", 3) + 1)
+
+        manifest_url = self._manifest_url()
+        objects_url = self._objects_url()
+
+        try:
+            while True:
                 if is_shutdown_requested():
-                    logger.info("Shutdown requested during batch processing")
-                    break
+                    logger.info("Shutdown requested during streaming walk")
+                    return
 
-                batch_start_time = time.time()
-                logger.info(
-                    f"📦 Processing batch {batch_count + 1} (offset: {current_offset}, size: {batch_size})"
-                )
+                page_start = time.time()
 
-                batch_objects = all_objects[
-                    current_offset : current_offset + batch_size
-                ]
+                # ==========================================================
+                # PHASE 1: collect up to manifest_batch_ids IDs by walking
+                # /manifest/ forward from next_manifest_cursor (or from
+                # scratch on first iteration). Manifest responses are
+                # small (~few KB even at 10k objects in the collection)
+                # so we loop until we've buffered enough IDs to make a
+                # /objects/ fetch worth doing.
+                # ==========================================================
+                buffered_ids: List[str] = []
+                # Track the LAST manifest cursor we saw so we can persist
+                # the checkpoint after this phase finishes (not after
+                # each tiny manifest page — that's redundant).
+                last_manifest_cursor = next_manifest_cursor
+                last_manifest_more = True
 
-                if not batch_objects:
-                    logger.info("✅ No more objects to process - completed")
-                    break
+                try:
+                    while len(buffered_ids) < manifest_batch_ids:
+                        # Raw GET against /manifest/. NO `limit` param.
+                        params: Optional[Dict[str, Any]] = None
+                        if last_manifest_cursor:
+                            params = {"next": last_manifest_cursor}
 
-                batch_time = time.time() - batch_start_time
-                total_processed += len(batch_objects)
-
-                # Log batch statistics
-                logger.info(f"📊 Batch {batch_count + 1} completed:")
-                logger.info(f"   Objects in batch: {len(batch_objects)}")
-                logger.info(f"   Processing time: {batch_time:.2f}s")
-                logger.info(f"   Total processed: {total_processed}")
-                logger.info(
-                    f"   Rate: {len(batch_objects) / batch_time:.1f} objects/sec"
-                )
-
-                # Log object type distribution for this batch
-                batch_types = {}
-                for obj in batch_objects:
-                    obj_type = (
-                        obj.get("type", "unknown")
-                        if isinstance(obj, dict)
-                        else getattr(obj, "type", "unknown")
-                    )
-                    batch_types[obj_type] = batch_types.get(obj_type, 0) + 1
-                logger.info(f"   Types: {dict(sorted(batch_types.items()))}")
-
-                # Cache progress after each batch
-                if redis_client and redis_client.is_connected():
-                    try:
-                        progress_data = {
-                            "last_offset": current_offset
-                            + len(batch_objects),  # Save next offset
-                            "batch_count": batch_count + 1,
-                            "total_processed": total_processed,
-                            "last_run_time": datetime.now().isoformat(),
-                            "timestamp": time.time(),
-                        }
-                        redis_client.set_cached_data(
-                            cache_key, progress_data, ttl_seconds=86400
-                        )  # 24 hour TTL
-                        logger.info(
-                            f"💾 Saved progress: next offset {current_offset + len(batch_objects)}"
+                        body, status, cursor = self._raw_get_json(
+                            manifest_url,
+                            params=params,
+                            timeout=http_timeout,
                         )
-                    except Exception as e:
-                        logger.warning(f"Failed to cache progress: {e}")
+                        # Update cursor for next manifest fetch
+                        last_manifest_cursor = cursor
+                        last_manifest_more = bool(body.get("more", False))
 
-                # Yield the batch for processing
-                yield batch_objects
+                        # Manifest records: {"id": "...", "date_added": "...",
+                        #                     "versions": [...], "media_type": "..."}.
+                        # We only need `id` for the subsequent /objects/ fetch.
+                        ids_on_page = [
+                            m["id"]
+                            for m in body.get("objects", [])
+                            if isinstance(m, dict) and m.get("id")
+                        ]
+                        buffered_ids.extend(ids_on_page)
+                        page_index += 1
 
-                # Update counters for next iteration
-                current_offset += len(batch_objects)
-                batch_count += 1
-
-                # Resource management: rest between batches
-                if rest_seconds > 0:
-                    logger.info(
-                        f"😴 Resting for {rest_seconds} seconds to manage system resources..."
+                        # If server says we're done walking manifest, stop
+                        # accumulating and proceed to PHASE 2 with what
+                        # we have.
+                        if not last_manifest_more or cursor is None:
+                            break
+                except _transport_errors as e:
+                    consecutive_failures += 1
+                    logger.warning(
+                        f"  Manifest fetch failed (page {page_index}): "
+                        f"{type(e).__name__}: {e}; "
+                        f"consecutive_failures={consecutive_failures}/"
+                        f"{max_consecutive_failures}"
                     )
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.error(
+                            f"  Giving up after {consecutive_failures} "
+                            f"consecutive manifest failures — bailing "
+                            f"out of run; checkpoint preserved"
+                        )
+                        return
+                    time.sleep(self.page_retry_backoff)
+                    continue
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        f"  Manifest returned non-JSON (page {page_index}): {e}"
+                    )
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        logger.error("Bailing — manifest endpoint is broken")
+                        return
+                    time.sleep(self.page_retry_backoff)
+                    continue
+
+                consecutive_failures = 0
+
+                # ==========================================================
+                # End-of-walk terminator: no IDs buffered AND manifest
+                # says we're done.
+                # ==========================================================
+                if not buffered_ids and not last_manifest_more:
+                    logger.info(
+                        f"✅ Manifest walk complete: {page_index} "
+                        f"manifest pages, {total_objects_yielded} "
+                        f"objects yielded"
+                    )
+                    if redis_client and redis_client.is_connected():
+                        try:
+                            redis_client.set_cached_data(
+                                completion_key,
+                                {
+                                    "completed_at": datetime.now(
+                                        timezone.utc
+                                    ).isoformat(),
+                                    "total_pages": page_index,
+                                    "total_processed": total_objects_yielded,
+                                },
+                                ttl_seconds=86400,
+                            )
+                            redis_client._redis_client.delete(cache_key)
+                            logger.info(
+                                "💾 Marked collection complete, cleared checkpoint"
+                            )
+                        except Exception:
+                            pass
+                    return
+
+                if not buffered_ids:
+                    # Server told us `more: true` but returned empty page —
+                    # skip and try again on next loop.
+                    next_manifest_cursor = last_manifest_cursor
+                    time.sleep(self.page_retry_backoff)
+                    continue
+
+                # ==========================================================
+                # PHASE 2: fetch full STIX objects for the buffered IDs.
+                # We slice into chunks of object_fetch_chunk because the
+                # server has to render each full STIX object and that
+                # adds up quickly on big collections.
+                #
+                # IMPORTANT: we drop any IDs we already know to be in
+                # Redis's processed_groupings set so we don't re-render
+                # objects MISP already has. (The caller
+                # process_batch_groupings also dedups, but skipping
+                # here saves upstream bandwidth.)
+                # ==========================================================
+                pending_ids: List[str] = list(buffered_ids)
+                # Preserve cursor state for the NEXT outer iteration.
+                next_manifest_cursor = last_manifest_cursor
+
+                yielded_any = False
+                for off in range(0, len(pending_ids), object_fetch_chunk):
+                    if is_shutdown_requested():
+                        return
+                    sub_ids = pending_ids[off : off + object_fetch_chunk]
+
+                    full_objects: List[Dict[str, Any]] = []
+                    try:
+                        # Raw GET /objects/?id=a,b,c — server returns the
+                        # STIX objects matching any of those IDs.
+                        body, status, cursor = self._raw_get_json(
+                            objects_url,
+                            params={"id": ",".join(sub_ids)},
+                            timeout=http_timeout,
+                        )
+                        objs = body.get("objects", []) or []
+                        if isinstance(objs, list):
+                            full_objects = [o for o in objs if isinstance(o, dict)]
+                    except _transport_errors as e:
+                        logger.warning(
+                            f"  Objects fetch failed for "
+                            f"{len(sub_ids)} IDs: "
+                            f"{type(e).__name__}: {e} — skipping chunk"
+                        )
+                        continue
+                    except json.JSONDecodeError as e:
+                        logger.warning(
+                            f"  Objects fetch returned non-JSON for "
+                            f"{len(sub_ids)} IDs: {e} — skipping chunk"
+                        )
+                        continue
+
+                    if not full_objects:
+                        continue
+
+                    yielded_any = True
+                    total_objects_yielded += len(full_objects)
+                    if page_index <= 5 or page_index % 10 == 1:
+                        logger.info(
+                            f"  Page {page_index}: yielded "
+                            f"+{len(full_objects)} objects "
+                            f"(total_yielded={total_objects_yielded})"
+                        )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        type_counts: Dict[str, int] = {}
+                        for obj in full_objects:
+                            ot = (
+                                obj.get("type")
+                                if isinstance(obj, dict)
+                                else getattr(obj, "type", None)
+                            ) or "unknown"
+                            type_counts[ot] = type_counts.get(ot, 0) + 1
+                        logger.debug(f"    types: {dict(sorted(type_counts.items()))}")
+
+                    # Persist checkpoint BEFORE yield so a crash mid-
+                    # yield doesn't cause us to re-process a batch.
+                    if redis_client and redis_client.is_connected():
+                        try:
+                            redis_client.set_cached_data(
+                                cache_key,
+                                {
+                                    "next_cursor": next_manifest_cursor,
+                                    "last_page_index": page_index,
+                                    "last_run_time": datetime.now(
+                                        timezone.utc
+                                    ).isoformat(),
+                                    "total_processed": total_objects_yielded,
+                                    "timestamp": time.time(),
+                                },
+                                ttl_seconds=86400,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to cache progress: {e}")
+
+                    yield full_objects
+
+                # If the manifest walk is fully complete and we still
+                # have nothing to yield, mark complete and stop.
+                if not yielded_any and not last_manifest_more:
+                    logger.info(
+                        f"✅ Manifest walk complete (nothing more to "
+                        f"yield): {page_index} manifest pages, "
+                        f"{total_objects_yielded} objects yielded"
+                    )
+                    if redis_client and redis_client.is_connected():
+                        try:
+                            redis_client.set_cached_data(
+                                completion_key,
+                                {
+                                    "completed_at": datetime.now(
+                                        timezone.utc
+                                    ).isoformat(),
+                                    "total_pages": page_index,
+                                    "total_processed": total_objects_yielded,
+                                },
+                                ttl_seconds=86400,
+                            )
+                            redis_client._redis_client.delete(cache_key)
+                        except Exception:
+                            pass
+                    return
+
+                # Courtesy sleep + periodic GC.
+                if rest_seconds and not is_shutdown_requested():
                     time.sleep(rest_seconds)
-
-                # Memory management: suggest garbage collection for large batches
-                if batch_size >= 5000:
-                    import gc
-
+                if page_index % 50 == 0:
                     gc.collect()
 
-            # Clear progress cache when completed successfully
-            if redis_client and redis_client.is_connected():
-                try:
-                    # Check if we've completed a full cycle (processed all objects)
-                    if batch_count > 0:
-                        # Mark completion with a special key
-                        completion_key = f"taxii_completion:{self.collection.id}"
-                        completion_data = {
-                            "completed_at": datetime.now().isoformat(),
-                            "total_processed": total_processed,
-                            "total_batches": batch_count,
-                        }
-                        redis_client.set_cached_data(
-                            completion_key, completion_data, ttl_seconds=86400
-                        )
-
-                        # Clear the progress cache to start fresh next time
-                        redis_client.redis_client.delete(cache_key)
-                        logger.info(
-                            "🧹 Cleared progress cache after successful completion - will start fresh next run"
-                        )
-                except Exception as e:
-                    logger.warning(f"Failed to clear progress cache: {e}")
-
-            logger.info(
-                f"🎯 Resource-managed retrieval completed: {total_processed} total objects processed in {batch_count} batches"
-            )
-
         except Exception as e:
-            logger.error(f"Error in resource-managed retrieval: {e}")
+            logger.error(
+                f"Error in streaming resource-managed retrieval: {e}",
+                exc_info=True,
+            )
             return
 
     def _fetch_batch_with_pages(self, offset, batch_size):
