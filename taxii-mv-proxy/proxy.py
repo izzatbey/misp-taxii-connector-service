@@ -300,9 +300,19 @@ def _fetch_manifest_page(
     )
 
     conn = get_db()
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(rebuilt, args)
-        rows = cur.fetchall()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(rebuilt, args)
+            rows = cur.fetchall()
+    except psycopg2.errors.Error as e:
+        # Surfaces when, e.g., a cursor row has a date_added / id field
+        # we can't parse (NULL, empty string, or unexpected type). The
+        # row-tuple comparison `> (NULL,...)` returns NULL which is
+        # filtered as FALSE — so this exception is unusual, but we
+        # catch defensively rather than 500'ing the connector. Log
+        # details so an operator can investigate.
+        log.error(f"manifest query failed: {type(e).__name__}: {e}; args={args!r}")
+        return [], None
 
     more = False
     nxt: Optional[str] = None
@@ -367,8 +377,12 @@ def _fetch_objects_page(
     """
 
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(sql, args)
-        rows = cur.fetchall()
+        try:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+        except psycopg2.errors.Error as e:
+            log.error(f"objects query failed: {type(e).__name__}: {e}; args={args!r}")
+            return [], None
 
     objs: List[Dict[str, Any]] = []
     last_row = None
@@ -381,32 +395,11 @@ def _fetch_objects_page(
         else:
             obj = sd
 
-        # ---- Wrap malformed STIX dicts so the downstream
-        # stix2.v21.parse() doesn't reject them. Some upstreams pushed
-        # bare pattern dicts lacking the mandatory top-level
-        # "type"/"id" fields. We detect that shape (a dict with
-        # `pattern`/`pattern_type` but no "type") and lift it into a
-        # proper STIX 2.1 indicator object. ----
-        if isinstance(obj, dict) and "type" not in obj:
-            pattern = obj.get("pattern") or ""
-            obj = {
-                "type": "indicator",
-                "spec_version": obj.get("spec_version", "2.1"),
-                "id": obj.get("id")
-                or f"indicator--{uuid.uuid5(uuid.NAMESPACE_URL, str(obj.get('created', '')) + str(pattern))}",
-                "created": obj.get("created"),
-                "modified": obj.get("modified"),
-                "created_by_ref": obj.get("created_by_ref"),
-                "description": obj.get("description", ""),
-                "indicator_types": obj.get("indicator_types", ["malicious-activity"]),
-                "pattern_type": obj.get("pattern_type", "stix"),
-                "pattern_version": obj.get("pattern_version", "2.1"),
-                "pattern": pattern,
-                "valid_from": obj.get("valid_from"),
-                "valid_until": obj.get("valid_until"),
-                "object_marking_refs": obj.get("object_marking_refs", []),
-                "extensions": obj.get("extensions", {}),
-            }
+        # Pass-through: return whatever OpenTAXII gave us, raw. No
+        # injection of synthetic indicators or groupings. The
+        # downstream MISP-side importer is responsible for handling
+        # objects that lack top-level type/id fields (which is a
+        # legitimate OpenTAXII data shape for some upstream sources).
 
         objs.append(obj)
         last_row = r
@@ -419,55 +412,6 @@ def _fetch_objects_page(
         pk_val = last_row.get("pk", last_row.get("pk_uuid", ""))
         nxt = f"{last_row['date_added']}|{last_row['id']}|{pk_val}"
         more = True
-
-    # ---- Synthesize a STIX grouping SDO that aggregates every object
-    # in this fetch into one virtual "bundle". The connector's
-    # extract_grouping_objects() only emits MISP events from
-    # object_refs hanging off STIX grouping SDOs. Many TAXII 2.1
-    # collections (this one included) carry only indicators with no
-    # groupings at all, which would otherwise produce zero events
-    # even when all the indicators parse cleanly. We add one grouping
-    # per /objects response that references every returned object.
-    # The grouping gets a deterministic id based on the sorted list
-    # of referenced indicator ids, so re-fetching the same page
-    # yields the same grouping id (Redis dedup-friendly). ----
-    if objs and not any(
-        (isinstance(o, dict) and o.get("type") == "grouping") for o in objs
-    ):
-        ref_ids = sorted(
-            o.get("id") for o in objs if isinstance(o, dict) and o.get("id")
-        )
-        if ref_ids:  # need at least one ref
-            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-            grouping_id = (
-                f"grouping--{uuid.uuid5(uuid.NAMESPACE_URL, ','.join(ref_ids))}"
-            )
-            objs.append(
-                {
-                    "type": "grouping",
-                    "spec_version": "2.1",
-                    "id": grouping_id,
-                    "created": now_iso,
-                    "modified": now_iso,
-                    "created_by_ref": (
-                        objs[0].get("created_by_ref")
-                        if objs and isinstance(objs[0], dict)
-                        else None
-                    ),
-                    "name": (
-                        objs[0].get("description", "TAXII batch")
-                        if objs and isinstance(objs[0], dict)
-                        else "TAXII batch"
-                    ),
-                    "context_refs": ref_ids[:1],  # any one of the refs
-                    "object_refs": ref_ids,
-                    "description": (
-                        "Auto-generated grouping produced by taxii-mv-proxy "
-                        "to aggregate batched TAXII 2.1 indicators into a "
-                        "single MISP event."
-                    ),
-                }
-            )
 
     return objs, nxt
 

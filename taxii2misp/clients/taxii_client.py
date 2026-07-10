@@ -1427,11 +1427,8 @@ class TAXIIClient:
             grouping_ids = []
 
             for obj in stix_objects:
-                # ---- Extract grouping IDs BEFORE attempting parse, so
-                # a stix2 library parse-error on the grouping object itself
-                # doesn't drop the grouping id (previously the parse was
-                # first, and any exception skipped the rest of the
-                # iteration including the grouping-id append).
+                # ---- Extract grouping IDs without parsing first so a
+                # subsequent parse error can't drop them.
                 if isinstance(obj, dict):
                     if obj.get("type") == "grouping":
                         gid = obj.get("id")
@@ -1444,6 +1441,9 @@ class TAXIIClient:
                 # ---- Now try to parse the object into a STIX SDO. We do
                 # this in a separate try/except per-object so a single
                 # parser failure doesn't take down the rest of the batch.
+                # If parse fails, skip this object — we do NOT inject raw
+                # dicts into the MemoryStore because that can crash
+                # downstream MISP-publisher code that expects real SDOs.
                 try:
                     if isinstance(obj, dict):
                         parsed_obj = parse(obj, allow_custom=True)
@@ -1452,17 +1452,22 @@ class TAXIIClient:
                         parsed_objects.append(obj)
                 except Exception as parse_error:
                     logger.warning(f"Failed to parse STIX object: {parse_error}")
-                    # On parse failure, fall back to a hand-rolled STIX
-                    # Indicator object so we still keep its data in the
-                    # memory store as a basic python dict. This avoids
-                    # "Failed to parse" silent drops for malformed
-                    # objects.
-                    if isinstance(obj, dict) and obj.get("pattern"):
-                        parsed_objects.append(obj)
                     continue
 
+            if not parsed_objects and not grouping_ids:
+                logger.warning("No valid STIX objects or groupings could be parsed")
+                return None, []
+
             if not parsed_objects:
-                logger.warning("No valid STIX objects could be parsed")
+                # We have real groupings but no parseable SDOs to back
+                # them — still possible to create a MISP event shell from
+                # the grouping metadata, but downstream code expects at
+                # least one parsed object to attach attributes from, so
+                # return empty here.
+                logger.warning(
+                    "Have grouping IDs but no parseable indicator objects — "
+                    "skipping batch"
+                )
                 return None, []
 
             # Create memory store
