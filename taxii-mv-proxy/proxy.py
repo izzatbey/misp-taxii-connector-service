@@ -40,14 +40,16 @@ import uuid
 import logging
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode, urlparse
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 import requests
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -75,6 +77,14 @@ PROXY_PUBLIC_URL = os.getenv("PROXY_PUBLIC_URL", UPSTREAM_TAXII_URL)
 DEFAULT_PAGE_SIZE = int(os.getenv("DEFAULT_PAGE_SIZE", "200"))
 MAX_PAGE_SIZE = int(os.getenv("MAX_PAGE_SIZE", "1000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# DB connection pool sizing. Under concurrent FastAPI/uvicorn requests
+# (which is the normal case once MISP_PARALLEL_WORKERS > 1 on the
+# taxii2misp side), a single global psycopg2 connection serialises all
+# queries. ThreadedConnectionPool lets the proxy serve multiple manifest
+# / objects requests in parallel. Keep min small (1) so a freshly
+# started proxy doesn't pre-allocate many connections it doesn't need.
+DB_POOL_MIN = max(1, int(os.getenv("PROXY_DB_POOL_MIN", "1")))
+DB_POOL_MAX = max(DB_POOL_MIN, int(os.getenv("PROXY_DB_POOL_MAX", "8")))
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -85,31 +95,76 @@ log = logging.getLogger("taxii-mv-proxy")
 # ------------------------------------------------------------------
 # DB connection pool (lazy)
 # ------------------------------------------------------------------
-_DB_CONN: Optional[psycopg2.extensions.connection] = None
+# A ThreadedConnectionPool lets multiple FastAPI/uvicorn worker threads
+# run manifest/objects queries in parallel instead of serialising on a
+# single global connection. The pool is created lazily on first use
+# and survives for the lifetime of the process.
+_DB_POOL: Optional[psycopg2.pool.ThreadedConnectionPool] = None
+_DB_POOL_LOCK = threading.Lock()
 
 
-def get_db() -> psycopg2.extensions.connection:
-    """Return a (re)connected psycopg2 connection."""
-    global _DB_CONN
-    if _DB_CONN is None or _DB_CONN.closed:
-        _DB_CONN = psycopg2.connect(
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            dbname=POSTGRES_DB,
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD,
-            connect_timeout=5,
-            application_name="taxii-mv-proxy",
-        )
-        _DB_CONN.autocommit = True
-    return _DB_CONN
+def _init_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    """Build the global ThreadedConnectionPool exactly once."""
+    global _DB_POOL
+    with _DB_POOL_LOCK:
+        if _DB_POOL is None:
+            log.info(
+                f"Initialising psycopg2 ThreadedConnectionPool "
+                f"(min={DB_POOL_MIN}, max={DB_POOL_MAX})"
+            )
+            _DB_POOL = psycopg2.pool.ThreadedConnectionPool(
+                minconn=DB_POOL_MIN,
+                maxconn=DB_POOL_MAX,
+                host=POSTGRES_HOST,
+                port=POSTGRES_PORT,
+                dbname=POSTGRES_DB,
+                user=POSTGRES_USER,
+                password=POSTGRES_PASSWORD,
+                connect_timeout=5,
+                application_name="taxii-mv-proxy",
+            )
+        return _DB_POOL
+
+
+@contextmanager
+def get_db():
+    """Context manager that yields a pooled psycopg2 connection.
+
+    The connection is returned to the pool on exit. Use as:
+        with get_db() as conn:
+            with conn.cursor() as cur: ...
+
+    Replaces the previous single global connection so concurrent
+    requests don't block on each other.
+    """
+    pool = _init_pool()
+    conn = pool.getconn()
+    try:
+        # Ensure autocommit is on (the pool may recycle a connection
+        # whose previous user had a transaction open).
+        if conn.closed:
+            # Recycle dead connection — psycopg2 pool re-uses them.
+            pool.putconn(conn, close=True)
+            conn = pool.getconn()
+        try:
+            conn.autocommit = True
+        except Exception:
+            pass
+        yield conn
+    finally:
+        try:
+            pool.putconn(conn)
+        except Exception as e:
+            log.warning(f"putconn failed (connection dropped from pool): {e}")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # warm DB connection so the first request isn't slow
+    # warm DB pool so the first request isn't slow
     try:
-        get_db().close()
+        with get_db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
         log.info("DB connectivity OK")
     except Exception as e:
         log.error(f"DB connectivity FAILED: {e}")
@@ -299,9 +354,11 @@ def _fetch_manifest_page(
         "LIMIT %s\n"
     )
 
-    conn = get_db()
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with (
+            get_db() as conn,
+            conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur,
+        ):
             cur.execute(rebuilt, args)
             rows = cur.fetchall()
     except psycopg2.errors.Error as e:
@@ -342,8 +399,6 @@ def _fetch_objects_page(
     The MV's serialized_data column already stores the STIX JSON
     object; we just JSON-decode and return it.
     """
-    conn = get_db()
-
     # We only emit the cursor predicate when there's an actual cursor.
     # Without a cursor, we want all rows matching the WHERE clause —
     # the tuple comparison vs NULL would exclude everything.
@@ -376,7 +431,10 @@ def _fetch_objects_page(
         LIMIT %s
     """
 
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    with (
+        get_db() as conn,
+        conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur,
+    ):
         try:
             cur.execute(sql, args)
             rows = cur.fetchall()
@@ -439,8 +497,7 @@ def _resolve_collection_title_column() -> Optional[str]:
     global _COLLECTION_TITLE_COLUMN
     if _COLLECTION_TITLE_COLUMN is not None:
         return _COLLECTION_TITLE_COLUMN
-    conn = get_db()
-    with conn.cursor() as cur:
+    with get_db() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_name = 'opentaxii_collection'"
@@ -458,8 +515,7 @@ def _collection_rows() -> List[Tuple[str, Optional[str]]]:
     """Return [(id, title_or_None), ...] from opentaxii_collection.
     Discovers title column on first call."""
     title_col = _resolve_collection_title_column()
-    conn = get_db()
-    with conn.cursor() as cur:
+    with get_db() as conn, conn.cursor() as cur:
         if title_col:
             cur.execute(f"SELECT id::text, {title_col} FROM opentaxii_collection")
         else:
@@ -731,8 +787,7 @@ def healthz():
     """Health check — exercises DB and upstream reachability."""
     db_ok = False
     try:
-        conn = get_db()
-        with conn.cursor() as cur:
+        with get_db() as conn, conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM opentaxii_stixobject_latest")
             _ = cur.fetchone()
         db_ok = True

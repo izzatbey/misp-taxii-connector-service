@@ -39,6 +39,7 @@ from dotenv import load_dotenv
 from clients.otx_client import OTXClient, OTXAPIUnavailable
 from config.settings import Config
 from services.pulse_processor import PulseProcessor
+from services.pulse_decay import PulseDecayFilter
 
 # ---------------------------------------------------------------------------
 # Globals + signal handling for graceful shutdown.
@@ -150,7 +151,20 @@ def run_one_ingest_cycle(
         "chunks_written": 0,
         "chunks_failed": 0,
         "chunks_skipped_already_in_taxii": 0,
+        "pulses_decayed": 0,
     }
+
+    # Recency / decay filter: skip stale pulses before we even fetch their
+    # indicators (saves OTX API calls + STIX build + outbox writes). Built
+    # once per cycle; counters are reported in the cycle summary below.
+    decay_filter = PulseDecayFilter.from_config(config)
+    if decay_filter.enabled and decay_filter.max_age_days > 0:
+        logging.info(
+            f"[ingest] Decay filter ACTIVE: skipping pulses whose created AND "
+            f"modified are older than {decay_filter.max_age_days} days."
+        )
+    else:
+        logging.info("[ingest] Decay filter DISABLED (all pulses processed).")
 
     existing_stix_ids: set[str] = set()  # We don't dedup against TAXII here;
     # main.py will do that. We DO need to skip indicator IDs that
@@ -172,6 +186,14 @@ def run_one_ingest_cycle(
         stats["pulses_seen"] += 1
         pulse_id = str(pulse_detail.get("id"))
         pulse_name = pulse_detail.get("name", "Unknown Pulse")
+
+        # --- Decay / recency gate ---------------------------------------
+        # Stale pulses (created AND modified older than PULSE_MAX_AGE_DAYS)
+        # are skipped before any indicator fetch, STIX build, or outbox
+        # write. This is the core of the decaying system.
+        if not decay_filter.should_process(pulse_detail):
+            stats["pulses_decayed"] += 1
+            continue
 
         try:
             pulse_indicators = otx_client.get_pulse_indicators(pulse_id)
@@ -248,8 +270,10 @@ def run_one_ingest_cycle(
         f"{stats['bundles_generated']} bundles generated, "
         f"{stats['chunks_written']} chunks written, "
         f"{stats['chunks_failed']} failed, "
-        f"{stats['chunks_skipped_already_in_taxii']} skipped (no new content)."
+        f"{stats['chunks_skipped_already_in_taxii']} skipped (no new content), "
+        f"{stats['pulses_decayed']} skipped (decayed/stale)."
     )
+    logging.info(f"[ingest] {decay_filter.summary()}")
     return stats
 
 
@@ -307,7 +331,9 @@ def main():
     logging.info(
         f"[ingest] Outbox dir: {config.STIX_OUTBOX_DIR}, "
         f"max_indicators_per_pulse={config.MAX_INDICATORS_PER_PULSE}, "
-        f"otx_max_list_pages={config.OTX_MAX_LIST_PAGES}"
+        f"otx_max_list_pages={config.OTX_MAX_LIST_PAGES}, "
+        f"pulse_decay_enabled={config.PULSE_DECAY_ENABLED}, "
+        f"pulse_max_age_days={config.PULSE_MAX_AGE_DAYS}"
     )
 
     signal.signal(signal.SIGINT, signal_handler)

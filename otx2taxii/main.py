@@ -17,6 +17,7 @@ from config.settings import Config
 from clients.otx_client import OTXClient, OTXAPIUnavailable
 from clients.taxii_client import TAXIIClient
 from services.pulse_processor import PulseProcessor
+from services.pulse_decay import PulseDecayFilter
 
 warnings.simplefilter("ignore", InsecureRequestWarning)
 logging.basicConfig(
@@ -218,6 +219,19 @@ def process_otx_to_taxii(
 ):
     logging.info("Starting OTX to TAXII synchronization process...")
 
+    # Recency / decay filter: skip stale pulses before submitting work to the
+    # executor. This avoids wasted OTX indicator fetches + STIX builds + TAXII
+    # pushes for threat intel that is no longer relevant. Built once per cycle;
+    # the counters are reported in the end-of-cycle summary.
+    decay_filter = PulseDecayFilter.from_config(config)
+    if decay_filter.enabled and decay_filter.max_age_days > 0:
+        logging.info(
+            f"Decay filter ACTIVE: skipping pulses whose created AND modified "
+            f"are older than {decay_filter.max_age_days} days."
+        )
+    else:
+        logging.info("Decay filter DISABLED (all pulses processed).")
+
     # For production use, ensure no artificial limits are enforced
     if config.OTX_TEST_PULSE_LIMIT is None:
         logging.info("Running in production mode - no pulse limit applied")
@@ -299,6 +313,14 @@ def process_otx_to_taxii(
             pulse_id = pulse_detail.get("id")
             pulse_name = pulse_detail.get("name", "N/A")
 
+            # --- Decay / recency gate ---------------------------------
+            # Skip stale pulses before submitting to the executor. This is
+            # the core of the decaying system: stale pulses never spawn a
+            # worker, so no OTX indicator fetch / STIX build / TAXII push
+            # happens for them. should_process() logs the skip reason.
+            if not decay_filter.should_process(pulse_detail):
+                continue
+
             # Per-worker private copy of the de-dup set.
             snapshot = existing_stix_ids.copy()
 
@@ -348,6 +370,7 @@ def process_otx_to_taxii(
     logging.info(
         f"Total STIX Bundles successfully pushed to TAXII: {pushed_bundles_count}"
     )
+    logging.info(decay_filter.summary())
 
     if pushed_bundles_count == 0:
         logging.info(

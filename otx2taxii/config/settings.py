@@ -104,6 +104,28 @@ class Config:
             os.getenv("MAX_INDICATORS_PER_PULSE", "200")
         )
 
+        # ------------------------------------------------------------------
+        # Pulse decay / recency filter (the "decaying system").
+        #
+        # A pulse is processed only if its `created` OR `modified` timestamp
+        # falls within the last PULSE_MAX_AGE_DAYS days. This prevents stale
+        # threat intel (created long ago AND untouched recently) from being
+        # re-fetched and re-pushed every cycle, keeping OTX->TAXII volume
+        # bounded.
+        #
+        # Set PULSE_DECAY_ENABLED=false to disable the filter entirely (no-op,
+        # all pulses processed). Set PULSE_MAX_AGE_DAYS=0 to disable too.
+        # Set PULSE_DECAY_STRICT_MISSING=true to skip pulses with no parseable
+        # timestamps (default false = process them, to avoid silent data loss).
+        # ------------------------------------------------------------------
+        self.PULSE_MAX_AGE_DAYS = int(os.getenv("PULSE_MAX_AGE_DAYS", "90"))
+        self.PULSE_DECAY_ENABLED = self._parse_boolean(
+            os.getenv("PULSE_DECAY_ENABLED", "true")
+        )
+        self.PULSE_DECAY_STRICT_MISSING = self._parse_boolean(
+            os.getenv("PULSE_DECAY_STRICT_MISSING", "false")
+        )
+
         # OTX SDK retry / timeout overrides.
         # OTXv2 mounts an HTTPAdapter with total=5 retries on
         # 429/500/502/503/504 + backoff_factor=1, which amplifies one
