@@ -1545,40 +1545,79 @@ class TAXIIClient:
                 seed = "|".join(ind_ids)
                 synth_id = f"grouping--{_uuid.uuid5(SYNTH_NAMESPACE, seed)}"
 
-                # Pick a sensible name: try the most common pattern_type
-                # in the batch, then a timestamp bucket.
+                # Pick a sensible name: most common pattern_type in the
+                # batch + a date bucket. Use the ORIGINAL raw-dict
+                # `created` string for the date bucket (it's already
+                # ISO-8601 from the upstream feed). We deliberately do
+                # NOT use str(indicator.created) here — that's a
+                # STIXdatetime whose repr is "YYYY-MM-DD HH:MM:SS" with
+                # a space separator, which stix2.parse() refuses
+                # ("Invalid value for Grouping 'created': must be a
+                # datetime object, date object, or timestamp string in
+                # a recognizable format").
                 pattern_types: dict = {}
-                earliest_created = None
-                for o in parsed_objects:
-                    if getattr(o, "type", None) != "indicator":
+                earliest_created_str = None
+                # Walk the ORIGINAL raw dicts (stix_objects) instead
+                # of parsed_objects so we get the original ISO-8601
+                # string for the `created` field.
+                for raw in stix_objects:
+                    if not isinstance(raw, dict):
                         continue
-                    pt = getattr(o, "pattern_type", "unknown")
+                    pt = raw.get("pattern_type", "unknown")
                     pattern_types[pt] = pattern_types.get(pt, 0) + 1
-                    c = getattr(o, "created", None)
+                    c = raw.get("created")
                     if c and (
-                        earliest_created is None or str(c) < str(earliest_created)
+                        earliest_created_str is None
+                        or str(c) < str(earliest_created_str)
                     ):
-                        earliest_created = c
+                        earliest_created_str = str(c)
                 top_pt = (
                     max(pattern_types, key=pattern_types.get)
                     if pattern_types
                     else "indicator"
                 )
                 date_bucket = (
-                    str(earliest_created)[:10] if earliest_created else "unknown"
+                    earliest_created_str[:10] if earliest_created_str else "unknown"
                 )
                 synth_name = f"TAXII batch {date_bucket} ({top_pt}, n={len(ind_ids)})"
+
+                # Normalise the timestamp to the strict format stix2
+                # accepts: "YYYY-MM-DDTHH:MM:SS.sssZ". The original
+                # value may be either "2026-07-02T14:51:43.000Z" (with
+                # Z) or "2026-07-02T14:51:43Z" (no millis). Force the
+                # millisecond form so the value is always parseable.
+                def _normalise_stix_ts(ts_str: str) -> str:
+                    """Coerce an arbitrary ISO-8601 string to the
+                    stix2-accepted canonical form 'YYYY-MM-DDTHH:MM:SS.sssZ'.
+                    If parsing fails, fall back to the unix epoch so
+                    the synth grouping at least parses."""
+                    from datetime import datetime as _dt
+
+                    if not ts_str:
+                        return "1970-01-01T00:00:00.000Z"
+                    s = ts_str.strip()
+                    # Strip trailing Z and replace with +00:00 so
+                    # fromisoformat can handle it on all Python builds.
+                    if s.endswith("Z"):
+                        s = s[:-1] + "+00:00"
+                    try:
+                        d = _dt.fromisoformat(s)
+                    except (ValueError, TypeError):
+                        return "1970-01-01T00:00:00.000Z"
+                    # Re-emit in canonical STIX form (always UTC, with millis).
+                    return (
+                        d.strftime("%Y-%m-%dT%H:%M:%S.")
+                        + f"{d.microsecond // 1000:03d}Z"
+                    )
+
+                ts_for_grouping = _normalise_stix_ts(earliest_created_str or "")
 
                 synth_grouping = {
                     "type": "grouping",
                     "spec_version": "2.1",
                     "id": synth_id,
-                    "created": str(earliest_created)
-                    if earliest_created
-                    else "1970-01-01T00:00:00.000Z",
-                    "modified": str(earliest_created)
-                    if earliest_created
-                    else "1970-01-01T00:00:00.000Z",
+                    "created": ts_for_grouping,
+                    "modified": ts_for_grouping,
                     "name": synth_name,
                     "context": "synthetic",
                     "object_refs": ind_ids,
