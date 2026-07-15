@@ -72,7 +72,13 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 DEFAULT_COLLECTION_ID = os.getenv("DEFAULT_COLLECTION_ID", "")
 UPSTREAM_TAXII_URL = os.getenv("UPSTREAM_TAXII_URL", "http://opentaxii-1:9000/taxii2/")
 PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
-PROXY_PORT = int(os.getenv("PROXY_PORT", "9000"))
+# NOTE: PROXY_PORT was changed from 9000 -> 9001 on 2026-07-13 to avoid
+# clashing with the upstream OpenTAXII container (which still binds 9000
+# on the same Docker network). The PROXY_PUBLIC_URL env var below should
+# be set to the host:port the *taxii2misp connector* uses to reach this
+# proxy, e.g. https://10.80.150.113:9001/taxii2/. The UPSTREAM_TAXII_URL
+# above is the internal address of OpenTAXII itself and stays on 9000.
+PROXY_PORT = int(os.getenv("PROXY_PORT", "9001"))
 PROXY_PUBLIC_URL = os.getenv("PROXY_PUBLIC_URL", UPSTREAM_TAXII_URL)
 DEFAULT_PAGE_SIZE = int(os.getenv("DEFAULT_PAGE_SIZE", "200"))
 MAX_PAGE_SIZE = int(os.getenv("MAX_PAGE_SIZE", "1000"))

@@ -1410,6 +1410,13 @@ class TAXIIClient:
         """
         Extract grouping objects and create a memory store for processing.
 
+        Tolerates the legacy OpenTAXII data shape where each STIX object is
+        a naked indicator-pattern dict (no top-level `type` or `id` field).
+        Such dicts are wrapped as proper STIX 2.1 indicators with a
+        deterministic id derived from the pattern + created timestamp, so
+        the rest of the pipeline (MemoryStore, misp_stix_converter, MISP
+        publish) can consume them.
+
         Returns:
             Tuple of (MemoryStore, list of grouping IDs)
         """
@@ -1425,6 +1432,7 @@ class TAXIIClient:
             # Parse STIX objects and create memory store
             parsed_objects = []
             grouping_ids = []
+            wrapped_count = 0
 
             for obj in stix_objects:
                 # ---- Extract grouping IDs without parsing first so a
@@ -1446,6 +1454,19 @@ class TAXIIClient:
                 # downstream MISP-publisher code that expects real SDOs.
                 try:
                     if isinstance(obj, dict):
+                        # Some OpenTAXII sources (and the taxii-mv-proxy
+                        # in its pass-through mode) return indicator-
+                        # pattern dicts that have `pattern`, `pattern_type`,
+                        # `created`, `modified`, `valid_from/until`,
+                        # `description`, `created_by_ref`, and
+                        # `object_marking_refs` but NO `type` or `id` field.
+                        # stix2.parse() rejects these with
+                        # "Can't parse object with no 'type' property".
+                        # Wrap them as proper STIX 2.1 indicators so the
+                        # rest of the pipeline can process them.
+                        if "type" not in obj or "id" not in obj:
+                            obj = self._wrap_naked_pattern_dict(obj)
+                            wrapped_count += 1
                         parsed_obj = parse(obj, allow_custom=True)
                         parsed_objects.append(parsed_obj)
                     elif hasattr(obj, "type"):
@@ -1453,6 +1474,12 @@ class TAXIIClient:
                 except Exception as parse_error:
                     logger.warning(f"Failed to parse STIX object: {parse_error}")
                     continue
+
+            if wrapped_count:
+                logger.info(
+                    f"Wrapped {wrapped_count} raw pattern dict(s) as STIX "
+                    f"indicators (legacy OpenTAXII data shape)."
+                )
 
             if not parsed_objects and not grouping_ids:
                 logger.warning("No valid STIX objects or groupings could be parsed")
@@ -1481,6 +1508,65 @@ class TAXIIClient:
         except Exception as e:
             logger.error(f"Error extracting grouping objects: {e}")
             return None, []
+
+    @staticmethod
+    def _wrap_naked_pattern_dict(raw: dict) -> dict:
+        """
+        Wrap a naked indicator-pattern dict (no 'type' or 'id') as a
+        proper STIX 2.1 indicator object.
+
+        Used by ``extract_grouping_objects`` when the upstream source
+        returns dicts that look like STIX indicators — ``pattern``,
+        ``pattern_type``, ``created``, ``modified``, ``valid_from/until``,
+        ``description``, ``created_by_ref``, ``object_marking_refs`` —
+        but omit the mandatory ``type`` and ``id`` fields.
+
+        The id is deterministically derived from the pattern + created
+        timestamp via uuid5 so the same indicator seen on a re-fetch maps
+        to the same id (idempotent across restarts / resyncs).
+
+        Returns a dict that ``stix2.v21.parse(allow_custom=True)`` will
+        accept as a valid STIX 2.1 Indicator SDO.
+        """
+        import hashlib
+        import uuid as _uuid
+
+        pattern = raw.get("pattern", "")
+        created = raw.get("created", "1970-01-01T00:00:00.000Z")
+        # Deterministic id: hash(pattern + created) -> indicator--<uuid5>.
+        # NOTE: pass a str to uuid5 (the canonical form). Some Python
+        # builds reject bytes here. Use a stable namespace for this
+        # connector so ids are reproducible across restarts / resyncs.
+        NAMESPACE = _uuid.UUID("0d7a8b7e-2b6e-4f1c-9f8a-2f8b2a1c4d5e")
+        ind_id = f"indicator--{_uuid.uuid5(NAMESPACE, pattern + '|' + created)}"
+        wrapped = {
+            "type": "indicator",
+            "spec_version": "2.1",
+            "id": ind_id,
+            "created": created,
+            "modified": raw.get("modified", created),
+            "pattern": pattern,
+            "pattern_type": raw.get("pattern_type", "stix"),
+            "pattern_version": raw.get("pattern_version", "2.1"),
+            "valid_from": raw.get("valid_from", created),
+        }
+        # Copy through optional STIX fields if present
+        for opt in (
+            "description",
+            "name",
+            "created_by_ref",
+            "object_marking_refs",
+            "indicator_types",
+            "valid_until",
+            "revoked",
+            "labels",
+            "external_references",
+            "x_opencti_score",
+            "x_opencti_description",
+        ):
+            if opt in raw:
+                wrapped[opt] = raw[opt]
+        return wrapped
 
     def get_collection_info(self):
         """Get information about the current collection."""

@@ -64,12 +64,15 @@ docker compose up -d
 4. Smoke-test:
 
 ```bash
-curl -k 'https://10.80.150.113:9000/taxii2/<api_root>/collections/<coll>/manifest/?limit=10'
+curl -k 'https://10.80.150.113:9001/taxii2/<api_root>/collections/<coll>/manifest/?limit=10'
 ```
 
 5. Point the `taxii2misp-connector`'s `DISCOVERY_URL` at the proxy's
-   TAXII URL (or replace the host running OpenTAXII's port 9000 with
-   this proxy — they're the same URL by default).
+   TAXII URL. By default the proxy listens on port **9001** (changed
+   2026-07-13 from 9000 to avoid clashing with the upstream OpenTAXII
+   container which still binds 9000 on the same Docker network).
+   Set `DISCOVERY_URL=https://10.80.150.113:9001/taxii2/` in the
+   `taxii2misp/.env`.
 
 ## Operational notes
 
