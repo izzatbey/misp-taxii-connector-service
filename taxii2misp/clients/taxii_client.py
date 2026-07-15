@@ -1497,6 +1497,108 @@ class TAXIIClient:
                 )
                 return None, []
 
+            # --------------------------------------------------------------
+            # Synthetic-grouping fallback.
+            #
+            # The legacy OpenTAXII collection used by this stack (and the
+            # /objects/?id endpoint behind the taxii-mv-proxy) returns
+            # naked indicator-pattern dicts but NO STIX `grouping` SDOs
+            # at all. The downstream pipeline (stix_processor.process_
+            # grouping + misp_stix_converter) requires a real STIX
+            # grouping object to drive MISP event creation. Without a
+            # grouping, every batch is silently dropped with
+            # "No groupings found in batch N" and ZERO MISP events are
+            # ever produced.
+            #
+            # Fix: when we have parsed indicators but no groupings,
+            # synthesise a virtual grouping SDO that references every
+            # indicator in the batch, with a deterministic id and a
+            # name derived from the indicator timestamps / pattern
+            # types. Add it to parsed_objects so the memory_store can
+            # return it via .get(synthetic_id). The processor treats it
+            # like a real grouping.
+            # --------------------------------------------------------------
+            if not grouping_ids:
+                import uuid as _uuid
+
+                SYNTH_NAMESPACE = _uuid.UUID("1b2e3a4c-5d6e-4f70-8a90-abcd12345678")
+                # Hash of all indicator ids in this batch — same batch ->
+                # same synthetic id, which keeps dedup stable across
+                # resume / re-runs.
+                ind_ids = sorted(
+                    str(getattr(o, "id", ""))
+                    for o in parsed_objects
+                    if getattr(o, "type", None) == "indicator"
+                )
+                if not ind_ids:
+                    # No indicators either — refuse to create an empty
+                    # grouping (it would produce an empty MISP event
+                    # and fail the quality filter anyway).
+                    logger.warning(
+                        "No indicator objects in batch — cannot synthesise "
+                        "a virtual grouping."
+                    )
+                    return None, []
+
+                # Pass a str to uuid5 (canonical form; some Python
+                # builds reject bytes here).
+                seed = "|".join(ind_ids)
+                synth_id = f"grouping--{_uuid.uuid5(SYNTH_NAMESPACE, seed)}"
+
+                # Pick a sensible name: try the most common pattern_type
+                # in the batch, then a timestamp bucket.
+                pattern_types: dict = {}
+                earliest_created = None
+                for o in parsed_objects:
+                    if getattr(o, "type", None) != "indicator":
+                        continue
+                    pt = getattr(o, "pattern_type", "unknown")
+                    pattern_types[pt] = pattern_types.get(pt, 0) + 1
+                    c = getattr(o, "created", None)
+                    if c and (
+                        earliest_created is None or str(c) < str(earliest_created)
+                    ):
+                        earliest_created = c
+                top_pt = (
+                    max(pattern_types, key=pattern_types.get)
+                    if pattern_types
+                    else "indicator"
+                )
+                date_bucket = (
+                    str(earliest_created)[:10] if earliest_created else "unknown"
+                )
+                synth_name = f"TAXII batch {date_bucket} ({top_pt}, n={len(ind_ids)})"
+
+                synth_grouping = {
+                    "type": "grouping",
+                    "spec_version": "2.1",
+                    "id": synth_id,
+                    "created": str(earliest_created)
+                    if earliest_created
+                    else "1970-01-01T00:00:00.000Z",
+                    "modified": str(earliest_created)
+                    if earliest_created
+                    else "1970-01-01T00:00:00.000Z",
+                    "name": synth_name,
+                    "context": "synthetic",
+                    "object_refs": ind_ids,
+                }
+                try:
+                    parsed_grouping = parse(synth_grouping, allow_custom=True)
+                    parsed_objects.append(parsed_grouping)
+                    grouping_ids = [synth_id]
+                    logger.info(
+                        f"Synthesised grouping {synth_id} ({synth_name}) "
+                        f"referencing {len(ind_ids)} indicator(s) "
+                        f"[legacy OpenTAXII data shape: no real groupings in feed]."
+                    )
+                except Exception as synth_err:
+                    logger.warning(
+                        f"Failed to parse synthetic grouping, "
+                        f"skipping batch: {synth_err}"
+                    )
+                    return None, []
+
             # Create memory store
             memory_store = MemoryStore(parsed_objects)
 
